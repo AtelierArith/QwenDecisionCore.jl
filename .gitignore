@@ -1,2 +1,4 @@
 Manifest.toml
 .cache/
+docs/Manifest.toml
+docs/build/
