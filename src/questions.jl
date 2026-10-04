@@ -34,7 +34,7 @@ NoulQuestion(; instructions::AbstractString = "") = NoulQuestion(String(instruct
     ScoreQuestion(criteria; instructions="")
 
 Construct a question with 2 to 10 ordered scale descriptions. Returned scores
-use Jeff's zero-based scale, from 0 to length(criteria) - 1.
+use the client's zero-based scale, from 0 to length(criteria) - 1.
 """
 struct ScoreQuestion <: AbstractQuestion
     criteria::Vector{String}

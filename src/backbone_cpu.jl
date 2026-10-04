@@ -933,7 +933,7 @@ function cpu_hidden_forward(
         )
     end
     # Attention consumes the full context. The final MLP is position-wise,
-    # and only the last position contributes to Jeff's trained readout.
+    # and only the last position contributes to the client's trained readout.
     layer = last(layers)
     normalized =
         normalization === nothing ? native_rms(hidden, layer.input_norm, cfg.eps) :

@@ -13,7 +13,7 @@ mutable struct ForwardWorkspace
 end
 const WORKSPACES = Dict{UInt,Tuple{WeakRef,ForwardWorkspace}}()
 const WORKSPACE_LOCK = ReentrantLock()
-const WORKSPACE_KEY = :jeff_native_cuda_workspace
+const WORKSPACE_KEY = :qdc_native_cuda_workspace
 
 function workspace(reference)
     @lock WORKSPACE_LOCK begin
