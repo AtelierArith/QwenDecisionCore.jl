@@ -476,7 +476,7 @@ end
 end
 @testset "Automatic CPU policy and scoped diagnostics" begin
     settings = QwenDecisionCore.cpu_settings()
-    withenv("JEFF_CPU_DELTA_CHUNK_SIZE" => "invalid", "JEFF_CPU_PARALLEL_HEADS" => "0") do
+    withenv("QDC_CPU_DELTA_CHUNK_SIZE" => "invalid", "QDC_CPU_PARALLEL_HEADS" => "0") do
         @test QwenDecisionCore.cpu_settings() == settings
         @test QwenDecisionCore.cpu_delta_chunk_size() == settings.delta_chunk_size
         @test QwenDecisionCore.cpu_setting(:parallel_heads)
