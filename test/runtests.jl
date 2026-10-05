@@ -7,7 +7,11 @@ import JSON
 import LinearAlgebra
 using QwenDecisionCore
 using QwenDecisionCore:
-    QwenBackbone, backbone_hidden, read_native_weights, write_native_weights
+    QwenBackbone,
+    backbone_hidden,
+    backbone_last_hidden,
+    read_native_weights,
+    write_native_weights
 
 const FIXTURE = joinpath(@__DIR__, "fixtures", "native")
 

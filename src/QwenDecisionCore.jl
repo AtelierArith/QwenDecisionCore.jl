@@ -24,7 +24,7 @@ end
 export AbstractDecisionBackend
 export AbstractQuestion, ChoiceQuestion, NoulQuestion, ScoreQuestion
 export option_count, probabilities, answer
-export QwenBackbone, backbone_hidden
+export QwenBackbone, backbone_hidden, backbone_last_hidden
 export resolve_checkpoint, read_native_weights, write_native_weights
 
 include("interfaces.jl")
