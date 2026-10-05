@@ -111,6 +111,9 @@ function batched_delta_recurrent_kernel!(
     return
 end
 
+@inline row_value(value, value_base, row, value_dim, token) =
+    row <= value_dim ? value[value_base+row, token] : 0.0f0
+
 # One recurrent step for a single value row held by a SIMD group.
 @inline function delta_row_step(state, keys, queries, factor, v, beta)
     state = map(s -> s * factor, state)
@@ -170,22 +173,22 @@ function delta_recurrent_rows4_kernel!(
         end
         factor = exp(decay[head, token])
         head_beta = beta[head, token]
-        row = first_row + Int32(1)
-        v = row <= value_dim ? value[value_base+row, token] : 0.0f0
-        state1, result = delta_row_step(state1, keys, queries, factor, v, head_beta)
-        lane == 1 && row <= value_dim && (output[row, head, token] = result)
-        row = first_row + Int32(2)
-        v = row <= value_dim ? value[value_base+row, token] : 0.0f0
-        state2, result = delta_row_step(state2, keys, queries, factor, v, head_beta)
-        lane == 1 && row <= value_dim && (output[row, head, token] = result)
-        row = first_row + Int32(3)
-        v = row <= value_dim ? value[value_base+row, token] : 0.0f0
-        state3, result = delta_row_step(state3, keys, queries, factor, v, head_beta)
-        lane == 1 && row <= value_dim && (output[row, head, token] = result)
-        row = first_row + Int32(4)
-        v = row <= value_dim ? value[value_base+row, token] : 0.0f0
-        state4, result = delta_row_step(state4, keys, queries, factor, v, head_beta)
-        lane == 1 && row <= value_dim && (output[row, head, token] = result)
+        v = row_value(value, value_base, first_row + Int32(1), value_dim, token)
+        state1, result1 = delta_row_step(state1, keys, queries, factor, v, head_beta)
+        v = row_value(value, value_base, first_row + Int32(2), value_dim, token)
+        state2, result2 = delta_row_step(state2, keys, queries, factor, v, head_beta)
+        v = row_value(value, value_base, first_row + Int32(3), value_dim, token)
+        state3, result3 = delta_row_step(state3, keys, queries, factor, v, head_beta)
+        v = row_value(value, value_base, first_row + Int32(4), value_dim, token)
+        state4, result4 = delta_row_step(state4, keys, queries, factor, v, head_beta)
+        # Every lane holds all four results after the butterfly reductions. Lanes
+        # 1-4 store one row each, so a SIMD group issues one store per token
+        # instead of four single-lane stores.
+        mine =
+            lane == Int32(1) ? result1 :
+            lane == Int32(2) ? result2 : lane == Int32(3) ? result3 : result4
+        row = first_row + lane
+        lane <= Int32(4) && row <= value_dim && (output[row, head, token] = mine)
     end
     return
 end
