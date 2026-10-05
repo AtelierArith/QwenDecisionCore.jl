@@ -16,7 +16,16 @@
         noul = answer(NoulQuestion(), probabilities(actual[2, 1:2], 1.25))
         weights = exp.((expected[2, 1:2] .- maximum(expected[2, 1:2])) ./ 1.25)
         @test noul.noul ≈ weights[2] / sum(weights) atol = 2e-5
+        for row in axes(inputs["input_ids"], 1)
+            ids = vec(inputs["input_ids"][row, :])
+            mask = vec(inputs["attention_mask"][row, :])
+            last = backbone_last_hidden(backend, ids, mask)
+            @test last ≈ backbone_hidden(backend, ids, mask)[:, end] atol=2e-5 rtol=2e-5
+            @test transpose(fixture_readout()) * last ≈ expected[row, :] atol=2e-5 rtol=2e-5
+        end
     end
+    @test_throws ArgumentError backbone_last_hidden(backend, Int64[1, 2], Int64[1])
+    @test_throws ArgumentError backbone_last_hidden(backend, Int64[64], Int64[1])
     # backbone_hidden owns the input validation; there is no client `logits`
     @test_throws ArgumentError backbone_hidden(backend, Int64[1, 2], Int64[1])
     @test_throws ArgumentError backbone_hidden(backend, Int64[], Int64[])

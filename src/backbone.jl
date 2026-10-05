@@ -401,6 +401,17 @@ function native_hidden_states(hidden, layers, mask, final_norm, cfg)
     return native_rms(hidden, final_norm, cfg.eps)
 end
 
+function check_sequence(backbone::QwenBackbone, ids, mask)
+    length(ids) == length(mask) ||
+        throw(ArgumentError("Input IDs and mask must have identical lengths."))
+    !isempty(ids) || throw(ArgumentError("Inputs must not be empty."))
+    all(id -> 0 <= id < size(backbone.embedding, 2), ids) ||
+        throw(ArgumentError("Token ID is outside the vocabulary."))
+    all(value -> value in (0, 1), mask) ||
+        throw(ArgumentError("Mask values must be zero or one."))
+    return nothing
+end
+
 """
     backbone_hidden(backbone, input_ids, attention_mask[, positions])
 
@@ -416,29 +427,57 @@ function backbone_hidden(
     mask::AbstractVector{<:Integer},
     positions::Union{Nothing,AbstractVector{<:Integer}} = nothing,
 )
-    length(ids) == length(mask) ||
-        throw(ArgumentError("Input IDs and mask must have identical lengths."))
-    !isempty(ids) || throw(ArgumentError("Inputs must not be empty."))
-    all(id -> 0 <= id < size(backbone.embedding, 2), ids) ||
-        throw(ArgumentError("Token ID is outside the vocabulary."))
-    all(value -> value in (0, 1), mask) ||
-        throw(ArgumentError("Mask values must be zero or one."))
-    hidden = native_gather(backbone.embedding, collect(Int, ids))
-    prepared = native_prepare_mask(hidden, collect(Int, mask))
-    states = native_forward_scope(hidden, length(ids)) do
-        native_hidden_states(
-            hidden,
-            backbone.layers,
-            prepared,
-            backbone.final_norm,
-            backbone.config,
+    check_sequence(backbone, ids, mask)
+    # The embedding identifies the model's forward workspace. Gathering, the
+    # forward and the host copy all run inside one scope, so a reused device
+    # buffer is read back before another forward can claim it.
+    states = native_forward_scope(backbone.embedding, length(ids)) do
+        hidden = native_gather(backbone.embedding, collect(Int, ids))
+        prepared = native_prepare_mask(hidden, collect(Int, mask))
+        native_host(
+            native_hidden_states(
+                hidden,
+                backbone.layers,
+                prepared,
+                backbone.final_norm,
+                backbone.config,
+            ),
         )
     end
-    states = native_host(states)
     positions === nothing && return states
     all(p -> 1 <= p <= size(states, 2), positions) ||
         throw(ArgumentError("Position is outside the sequence."))
     return states[:, collect(Int, positions)]
+end
+
+"""
+    backbone_last_hidden(backbone, input_ids, attention_mask)
+
+Final-normalized hidden state of the last position only, as a vector of length
+`hidden`. A linear readout needs nothing else, so this uses the last-token
+forward (`native_hidden_forward`), which accelerator and CPU paths specialize;
+it is cheaper than `backbone_hidden(...)[:, end]`.
+"""
+function backbone_last_hidden(
+    backbone::QwenBackbone,
+    ids::AbstractVector{<:Integer},
+    mask::AbstractVector{<:Integer},
+)
+    check_sequence(backbone, ids, mask)
+    state = native_forward_scope(backbone.embedding, length(ids)) do
+        hidden = native_gather(backbone.embedding, collect(Int, ids))
+        prepared = native_prepare_mask(hidden, collect(Int, mask))
+        native_host(
+            native_hidden_forward(
+                hidden,
+                backbone.layers,
+                prepared,
+                backbone.final_norm,
+                backbone.config,
+            ),
+        )
+    end
+    return vec(state)
 end
 
 function backbone_hidden(
