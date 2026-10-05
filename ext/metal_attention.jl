@@ -42,7 +42,10 @@ function QwenDecisionCore.full_attention(attention, x::Metal.MtlMatrix{Float32},
     scores = head_matmul(key, query, 'T', 'N')
     probabilities = masked_softmax(scores, mask, cfg.head_dim)
     values = head_matmul(value, probabilities, 'N', 'N')
-    return QwenDecisionCore.native_linear(attention.out, merge_gate(values, qgate, cfg, length))
+    return QwenDecisionCore.native_linear(
+        attention.out,
+        merge_gate(values, qgate, cfg, length),
+    )
 end
 
 function causal_depthwise_kernel!(output, input, weight, channels, length, kernel)
@@ -61,9 +64,60 @@ function causal_depthwise_kernel!(output, input, weight, channels, length, kerne
     return
 end
 
+# Four taps slide through registers: one thread owns a channel and a chunk of
+# CHUNK consecutive tokens, so each input element is read once and each channel's
+# weights are read once per chunk. The tap order matches the generic kernel, so
+# results are identical.
+function causal_depthwise_four_taps_kernel!(
+    output,
+    input,
+    weight,
+    channels,
+    length,
+    ::Val{CHUNK},
+) where {CHUNK}
+    index = Metal.thread_position_in_grid_2d()
+    channel, chunk = Int32(index.x), Int32(index.y)
+    if channel <= channels
+        w1 = weight[1, channel]
+        w2 = weight[2, channel]
+        w3 = weight[3, channel]
+        w4 = weight[4, channel]
+        first_token = (chunk - Int32(1)) * Int32(CHUNK) + Int32(1)
+        x1 = first_token > 3 ? input[channel, first_token-3] : 0.0f0
+        x2 = first_token > 2 ? input[channel, first_token-2] : 0.0f0
+        x3 = first_token > 1 ? input[channel, first_token-1] : 0.0f0
+        for offset = Int32(0):Int32(CHUNK-1)
+            token = first_token + offset
+            if token <= length
+                x4 = input[channel, token]
+                value = x1 * w1 + x2 * w2 + x3 * w3 + x4 * w4
+                output[channel, token] = QwenDecisionCore.native_silu(value)
+                x1, x2, x3 = x2, x3, x4
+            end
+        end
+    end
+    return
+end
+
 function QwenDecisionCore.causal_depthwise(input::Metal.MtlMatrix{Float32}, weight)
     channels, length = size(input)
     output = pooled_array(Float32, size(input))
+    if size(weight, 1) == 4
+        chunk = 4
+        launch_cached_kernel!(
+            causal_depthwise_four_taps_kernel!,
+            output,
+            input,
+            weight,
+            Int32(channels),
+            Int32(length),
+            Val(chunk);
+            threads = (64, 1),
+            groups = (cld(channels, 64), cld(length, chunk)),
+        )
+        return output
+    end
     launch_cached_kernel!(
         causal_depthwise_kernel!,
         output,
