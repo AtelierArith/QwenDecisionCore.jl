@@ -43,9 +43,13 @@ write_native_weights("out.safetensors", tensors)        # round trips exactly
 ```
 
 `QwenBackbone(directory; device = :cpu)` also accepts `:metal` and `:cuda`
-after importing Metal / CUDA; CPU inference selects its platform policy
-automatically. A Metal extension can additionally expose a batched forward
-through `batch_backbone_hidden` when `QDC_METAL_BATCHED=1`.
+after importing Metal / CUDA. The Apple Accelerate fast path is an **opt-in weak
+dependency**: add `AppleAccelerate` to your environment and load it (`using
+AppleAccelerate`); its extension forwards BLAS to Accelerate on Apple silicon
+and re-applies the CPU policy, in either load order. With it absent the portable
+CPU policy runs on every platform, including Linux. A Metal extension can
+additionally expose a batched forward through `batch_backbone_hidden` when
+`QDC_METAL_BATCHED=1`.
 
 ## Tests
 

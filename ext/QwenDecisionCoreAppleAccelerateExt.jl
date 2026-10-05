@@ -39,4 +39,12 @@ function QwenDecisionCore.cpu_owned_mlp_gate!(gate::Matrix{Float32}, up::Matrix{
     return gate
 end
 
+# Loading AppleAccelerate forwards BLAS to Accelerate (AppleAccelerate's own
+# `__init__`). Re-run the CPU policy here so `accelerate` / `vector_math` are set
+# whichever order the caller loads QwenDecisionCore and AppleAccelerate in.
+function __init__()
+    QwenDecisionCore.initialize_cpu!()
+    return nothing
+end
+
 end

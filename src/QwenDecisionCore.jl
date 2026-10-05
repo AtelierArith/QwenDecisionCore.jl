@@ -17,9 +17,6 @@ import JSON
 import Scratch
 using LinearAlgebra
 import LoopVectorization
-@static if Sys.isapple() && Sys.ARCH === :aarch64
-    import AppleAccelerate
-end
 
 export AbstractDecisionBackend
 export AbstractQuestion, ChoiceQuestion, NoulQuestion, ScoreQuestion
