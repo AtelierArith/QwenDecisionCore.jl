@@ -111,6 +111,85 @@ function batched_delta_recurrent_kernel!(
     return
 end
 
+# One recurrent step for a single value row held by a SIMD group.
+@inline function delta_row_step(state, keys, queries, factor, v, beta)
+    state = map(s -> s * factor, state)
+    prediction = warp_sum(sum(map(*, state, keys)))
+    correction = (v - prediction) * beta
+    state = map((s, k) -> s + correction * k, state, keys)
+    return state, warp_sum(sum(map(*, state, queries)))
+end
+
+# The recurrence is bound by the per-token key/query loads, which every value
+# row of a head repeats. A SIMD group therefore owns four consecutive value rows
+# and loads them once per token. Only the key width 128 (four values per lane)
+# uses this kernel; each row's arithmetic is unchanged.
+function delta_recurrent_rows4_kernel!(
+    output,
+    query,
+    key,
+    value,
+    beta,
+    decay,
+    key_dim,
+    value_dim,
+    value_start,
+    groups,
+    sequence_length,
+    value_heads,
+    ::Val{KEY_VALUES},
+    ::Val{ROWS},
+) where {KEY_VALUES,ROWS}
+    local_index = Metal.thread_position_in_threadgroup_2d()
+    group_index = Metal.threadgroup_position_in_grid_2d()
+    lane = Int32(local_index.x)
+    first_row =
+        (
+            (Int32(group_index.x) - Int32(1)) * Int32(ROWS) + Int32(local_index.y) -
+            Int32(1)
+        ) * Int32(4)
+    head_sample = Int32(group_index.y) - Int32(1)
+    head = rem(head_sample, value_heads) + Int32(1)
+    token_offset = (head_sample ÷ value_heads) * sequence_length
+    key_head = cld(head, groups)
+    value_base = value_start + (head - Int32(1)) * value_dim
+    zero_state = ntuple(_ -> 0.0f0, Val(KEY_VALUES))
+    state1 = zero_state
+    state2 = zero_state
+    state3 = zero_state
+    state4 = zero_state
+    for local_token = Int32(1):sequence_length
+        token = token_offset + local_token
+        keys = ntuple(Val(KEY_VALUES)) do part
+            component = lane + Int32(32 * (part - 1))
+            component <= key_dim ? key[component, key_head, token] : 0.0f0
+        end
+        queries = ntuple(Val(KEY_VALUES)) do part
+            component = lane + Int32(32 * (part - 1))
+            component <= key_dim ? query[component, key_head, token] : 0.0f0
+        end
+        factor = exp(decay[head, token])
+        head_beta = beta[head, token]
+        row = first_row + Int32(1)
+        v = row <= value_dim ? value[value_base+row, token] : 0.0f0
+        state1, result = delta_row_step(state1, keys, queries, factor, v, head_beta)
+        lane == 1 && row <= value_dim && (output[row, head, token] = result)
+        row = first_row + Int32(2)
+        v = row <= value_dim ? value[value_base+row, token] : 0.0f0
+        state2, result = delta_row_step(state2, keys, queries, factor, v, head_beta)
+        lane == 1 && row <= value_dim && (output[row, head, token] = result)
+        row = first_row + Int32(3)
+        v = row <= value_dim ? value[value_base+row, token] : 0.0f0
+        state3, result = delta_row_step(state3, keys, queries, factor, v, head_beta)
+        lane == 1 && row <= value_dim && (output[row, head, token] = result)
+        row = first_row + Int32(4)
+        v = row <= value_dim ? value[value_base+row, token] : 0.0f0
+        state4, result = delta_row_step(state4, keys, queries, factor, v, head_beta)
+        lane == 1 && row <= value_dim && (output[row, head, token] = result)
+    end
+    return
+end
+
 function batched_delta_recurrent(query, key, mixed, beta, decay, cfg, sequence_length)
     columns = size(mixed, 2)
     sequence_length > 0 && columns > 0 && columns % sequence_length == 0 ||
@@ -131,8 +210,9 @@ function batched_delta_recurrent(query, key, mixed, beta, decay, cfg, sequence_l
     output = pooled_array(Float32, (cfg.value_dim, cfg.value_heads, columns))
     rows = 8
     if cfg.key_dim == 128
+        rows = 4
         launch_cached_kernel!(
-            batched_delta_recurrent_kernel!,
+            delta_recurrent_rows4_kernel!,
             output,
             query,
             key,
@@ -146,10 +226,10 @@ function batched_delta_recurrent(query, key, mixed, beta, decay, cfg, sequence_l
             Int32(sequence_length),
             Int32(cfg.value_heads),
             Val(4),
-            Val(8);
+            Val(rows);
             threads = (32, rows),
             groups = (
-                cld(cfg.value_dim, rows),
+                cld(cfg.value_dim, 4rows),
                 cfg.value_heads * (columns ÷ sequence_length),
             ),
         )
@@ -418,8 +498,9 @@ function delta_attention_masked(attention, masked, cfg)
     key_values = cld(cfg.key_dim, 32)
     rows = 8
     if cfg.key_dim == 128
+        rows = 4
         launch_cached_kernel!(
-            delta_recurrent_kernel!,
+            delta_recurrent_rows4_kernel!,
             output,
             query,
             key,
@@ -431,10 +512,11 @@ function delta_attention_masked(attention, masked, cfg)
             Int32(2key_width),
             Int32(cfg.value_heads ÷ cfg.key_heads),
             Int32(length),
+            Int32(cfg.value_heads),
             Val(4),
-            Val(8);
+            Val(rows);
             threads = (32, rows),
-            groups = (cld(cfg.value_dim, rows), cfg.value_heads),
+            groups = (cld(cfg.value_dim, 4rows), cfg.value_heads),
         )
     else
         Metal.@metal threads=(32, rows) groups=(cld(cfg.value_dim, rows), cfg.value_heads) delta_recurrent_kernel!(
