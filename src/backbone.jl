@@ -16,8 +16,9 @@ float32 inference, default partial RoPE, and bias-free projections are
 currently supported.
 
 `directory` is a local checkpoint directory or a Hugging Face repository ID.
-Use `device=:metal` after importing Metal for Apple GPU execution, or
-`device=:cuda` after importing CUDA for NVIDIA GPU execution. CPU inference
+Use `device=:metal` after importing Metal for Apple GPU execution,
+`device=:cuda` after importing CUDA for NVIDIA GPU execution, or
+`device=:amdgpu` after importing AMDGPU for AMD GPU execution. CPU inference
 automatically selects its platform policy.
 """
 struct QwenBackbone{E,L,N,C}
