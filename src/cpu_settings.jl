@@ -11,6 +11,8 @@ function cpu_defaults(apple::Bool)
         projection_thread_scope = true,
         parallel_full_heads = portable,
         recurrent_delta = portable,
+        recurrent_vector_math = portable,
+        fused_convolution = portable,
         delta_norm_loop = portable,
         delta_workspace = portable,
         delta_projection_workspace = portable,
@@ -51,8 +53,11 @@ function initialize_cpu!()
         Sys.ARCH === :aarch64 &&
         any(lib -> occursin("Accelerate", lib.libname), BLAS.get_config().loaded_libs)
     CPU_DEFAULTS[] = cpu_defaults(apple)
-    BLAS.set_num_threads(
-        apple || Threads.nthreads(:default) == 1 ? min(8, Sys.CPU_THREADS) : 1,
-    )
+    # Large projections benefit from one BLAS team instead of independent
+    # row-block GEMMs. Small Julia pools retain the row-block policy.
+    workers = Threads.nthreads(:default)
+    blas_threads = apple || workers == 1 ? min(8, Sys.CPU_THREADS) :
+                   workers >= 4 ? min(4, Sys.CPU_THREADS) : 1
+    BLAS.set_num_threads(blas_threads)
     return nothing
 end

@@ -51,6 +51,11 @@ absent the portable CPU policy runs on every platform, including Linux. A Metal
 extension can additionally expose a batched forward through
 `batch_backbone_hidden` when `QDC_METAL_BATCHED=1`.
 
+CPU inference reuses forward-local attention, normalization and MLP workspaces
+for both all-token and last-token outputs. For reproducible before/after speed
+measurements with synthetic or local model weights, see
+[the CPU benchmark](benchmark/README.md).
+
 ## Tests
 
 ```bash

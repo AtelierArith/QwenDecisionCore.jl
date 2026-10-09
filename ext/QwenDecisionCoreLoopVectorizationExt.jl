@@ -214,4 +214,36 @@ function QwenDecisionCore.cpu_portable_gate!(gate::Matrix{Float32}, up::Matrix{F
     return true
 end
 
+# Reduce along the key dimension while keeping each SIMD group of value rows
+# in registers, rather than loading/storing the scratch vector for every key.
+function QwenDecisionCore.cpu_delta_recurrent_step!(
+    state::Matrix{Float32}, projected, result, q::Array{Float32,3},
+    k::Array{Float32,3}, v::Array{Float32,3}, beta, factor, token, head, kh,
+)
+    if !QwenDecisionCore.cpu_setting(:recurrent_vector_math) || isempty(state)
+        return invoke(
+            QwenDecisionCore.cpu_delta_recurrent_step!,
+            Tuple{Any,Any,Any,Any,Any,Any,Any,Any,Any,Any,Any},
+            state, projected, result, q, k, v, beta, factor, token, head, kh,
+        )
+    end
+    @turbo for row in axes(state, 1)
+        value = 0.0f0
+        for column in axes(state, 2)
+            value += state[row, column] * k[column, token, kh]
+        end
+        projected[row] = beta * (v[row, token, head] - factor * value)
+    end
+    @turbo for row in axes(state, 1)
+        value = 0.0f0
+        for column in axes(state, 2)
+            updated = factor * state[row, column] + projected[row] * k[column, token, kh]
+            state[row, column] = updated
+            value += updated * q[column, token, kh]
+        end
+        result[row] = value
+    end
+    return nothing
+end
+
 end

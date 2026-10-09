@@ -1,0 +1,16 @@
+Validated 2026-10-09
+CPU: AMD Ryzen 9 PRO 8945HS
+Checkpoint: mstrasser/Jeff-Qwen3.5-0.8B
+Revision: 0f212b3e72acb4dde3f7da61e925d6ab7f819990
+API: backbone_hidden (all token positions)
+Samples: 21 per implementation per input length, alternating order
+Other machine workloads were present; absolute timings vary with load.
+Command: julia -t 4 --project=. benchmark/cpu.jl --checkpoint <local snapshot> --require-speedup 10
+Exit status: 0
+
+Julia 1.13.1; Julia threads=4; baseline BLAS threads=1; optimized BLAS threads=4
+(tokens = 64, baseline_ms = 893.203072, optimized_ms = 588.32281, speedup_percent = 51.82193462803184, time_reduction_percent = 34.13336469133863, max_error = 3.0040741f-5)
+(tokens = 128, baseline_ms = 652.09555, optimized_ms = 636.357061, speedup_percent = 2.473216683612778, time_reduction_percent = 2.4135249811166437, max_error = 2.3841858f-5)
+(tokens = 256, baseline_ms = 817.449956, optimized_ms = 793.194902, speedup_percent = 3.0578933297279454, time_reduction_percent = 2.9671607199890926, max_error = 4.2915344f-5)
+(tokens = 512, baseline_ms = 1978.823421, optimized_ms = 1855.2652560000001, speedup_percent = 6.659865191805214, time_reduction_percent = 6.2440217600395975, max_error = 4.005432f-5)
+(aggregate_baseline_ms = 4341.571999, aggregate_optimized_ms = 3873.140029, speedup_percent = 12.094372175873612, time_reduction_percent = 10.789455296558348)

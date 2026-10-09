@@ -672,6 +672,33 @@ function cpu_delta_heads!(
     return nothing
 end
 
+# Scalar reference and fallback for the portable SIMD extension.
+function cpu_delta_recurrent_step!(
+    state, projected, result, q, k, v, beta, factor, token, head, kh,
+)
+    fill!(projected, 0.0f0)
+    for column = 1:size(state, 2)
+        key = k[column, token, kh]
+        @inbounds @simd for row = 1:size(state, 1)
+            projected[row] += state[row, column] * key
+        end
+    end
+    @inbounds @simd for row = 1:size(state, 1)
+        projected[row] = beta * (v[row, token, head] - factor * projected[row])
+    end
+    fill!(result, 0.0f0)
+    for column = 1:size(state, 2)
+        key = k[column, token, kh]
+        query = q[column, token, kh]
+        @inbounds @simd for row = 1:size(state, 1)
+            updated = factor * state[row, column] + projected[row] * key
+            state[row, column] = updated
+            result[row] += updated * query
+        end
+    end
+    return nothing
+end
+
 function cpu_delta_recurrent_heads!(
     heads,
     out,
@@ -688,35 +715,17 @@ function cpu_delta_recurrent_heads!(
 )
     state = owned.state
     # The first scratch columns are worker-owned and no chunk products use them
-    # on this path. Reset before each token; reset the state before each head.
+    # on this path. The step overwrites scratch; reset the state before each head.
     projected = @view owned.full.corrections[:, 1]
     result = @view owned.full.result[:, 1]
     for head in heads
         fill!(state, 0.0f0)
         kh = cld(head, groups)
         for token in axes(out, 2)
-            fill!(projected, 0.0f0)
             factor = exp(decay[head, token])
-            for column = 1:cfg.key_dim
-                key = k[column, token, kh]
-                @inbounds @simd for row = 1:cfg.value_dim
-                    projected[row] += state[row, column] * key
-                end
-            end
-            @inbounds @simd for row = 1:cfg.value_dim
-                projected[row] =
-                    beta[head, token] * (v[row, token, head] - factor * projected[row])
-            end
-            fill!(result, 0.0f0)
-            for column = 1:cfg.key_dim
-                key = k[column, token, kh]
-                query = q[column, token, kh]
-                @inbounds @simd for row = 1:cfg.value_dim
-                    updated = factor * state[row, column] + projected[row] * key
-                    state[row, column] = updated
-                    result[row] += updated * query
-                end
-            end
+            cpu_delta_recurrent_step!(
+                state, projected, result, q, k, v, beta[head, token], factor, token, head, kh,
+            )
             scale = inv(sqrt(sum(abs2, result) / cfg.value_dim + cfg.eps))
             offset = (head - 1) * cfg.value_dim
             @inbounds for row = 1:cfg.value_dim
@@ -752,9 +761,40 @@ function cpu_depthwise(
     return output
 end
 
+# Four taps are the Qwen default. Keep their order while traversing the
+# projection once, so each output stays in a SIMD register across all taps.
+function cpu_convolution_four!(output, input, coefficients)
+    channels, n = size(input)
+    for token = 1:min(3, n)
+        @inbounds @simd for channel = 1:channels
+            value = output[channel, token]
+            for tap = (5-token):4
+                value += input[channel, token-4+tap] * coefficients[channel, tap]
+            end
+            output[channel, token] = value
+        end
+    end
+    for token = 4:n
+        @inbounds @simd for channel = 1:channels
+            value = output[channel, token]
+            value += input[channel, token-3] * coefficients[channel, 1]
+            value += input[channel, token-2] * coefficients[channel, 2]
+            value += input[channel, token-1] * coefficients[channel, 3]
+            value += input[channel, token] * coefficients[channel, 4]
+            output[channel, token] = value
+        end
+    end
+    return output
+end
+
 function cpu_convolution!(output, input, weight)
     channels, sequence_length = size(input)
     kernel = size(weight, 1)
+    if kernel == 4 && weight isa Transpose{Float32,Matrix{Float32}} &&
+       cpu_setting(:fused_convolution) && !Base.mightalias(output, input) &&
+       !Base.mightalias(output, weight)
+        return cpu_convolution_four!(output, input, parent(weight))
+    end
     for index = 1:kernel
         lag = kernel - index
         # Safetensors weights are strided reinterpret wrappers. Materialize one
@@ -777,8 +817,15 @@ function native_hidden_forward(hidden::Matrix{Float32}, layers, mask, final_norm
     end
 end
 
-function cpu_hidden_forward_scoped(hidden, layers, mask, final_norm, cfg)
+function native_hidden_states(hidden::Matrix{Float32}, layers, mask, final_norm, cfg)
+    return cpu_projection_scope() do
+        cpu_hidden_forward_scoped(hidden, layers, mask, final_norm, cfg; all_tokens = true)
+    end
+end
+
+function cpu_hidden_forward_scoped(hidden, layers, mask, final_norm, cfg; all_tokens = false)
     if isempty(layers)
+        all_tokens && return native_rms(hidden, final_norm, cfg.eps)
         return cpu_setting(:final_token_only) ?
                native_rms(hidden[:, end:end], final_norm, cfg.eps) :
                native_rms(hidden, final_norm, cfg.eps)[:, end:end]
@@ -808,6 +855,7 @@ function cpu_hidden_forward_scoped(hidden, layers, mask, final_norm, cfg)
                 nothing,
                 projections,
                 normalization,
+                all_tokens,
             )
         end
         return cpu_hidden_forward(
@@ -820,6 +868,7 @@ function cpu_hidden_forward_scoped(hidden, layers, mask, final_norm, cfg)
             delta_buffers,
             projections,
             normalization,
+            all_tokens,
         )
     end
     if delta_buffers === nothing
@@ -833,6 +882,7 @@ function cpu_hidden_forward_scoped(hidden, layers, mask, final_norm, cfg)
             nothing,
             projections,
             normalization,
+            all_tokens,
         )
     end
     return cpu_hidden_forward(
@@ -845,6 +895,7 @@ function cpu_hidden_forward_scoped(hidden, layers, mask, final_norm, cfg)
         delta_buffers,
         projections,
         normalization,
+        all_tokens,
     )
 end
 
@@ -899,8 +950,9 @@ function cpu_hidden_forward(
     delta_buffers,
     projections = nothing,
     normalization = nothing,
+    all_tokens = false,
 )
-    if !cpu_setting(:final_token_only)
+    if all_tokens || !cpu_setting(:final_token_only)
         # Match a backbone that computes every position through the final MLP
         # and final normalization, then selects the last token for readout.
         for layer in layers
@@ -918,7 +970,7 @@ function cpu_hidden_forward(
         normalized =
             normalization === nothing ? native_rms(hidden, final_norm, cfg.eps) :
             cpu_rms!(normalization.normalized, hidden, final_norm, cfg.eps)
-        return normalized[:, end:end]
+        return all_tokens ? normalized : normalized[:, end:end]
     end
     for index = 1:(length(layers)-1)
         hidden = cpu_layer_with_mlp_workspace(

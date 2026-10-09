@@ -500,3 +500,120 @@ end
     @test QwenDecisionCore.cpu_settings() == settings
     @test settings.mlp_workspace && settings.trim_padding
 end
+
+@testset "CPU vectorized recurrent Delta state and output" begin
+    QDC = QwenDecisionCore
+    # Include non-vector widths, grouped heads, and production head widths.
+    for (vd, kd) in ((1, 1), (7, 3), (32, 16), (128, 128)), n in (1, 65)
+        q = reshape(sin.(Float32.(1:(kd*n*2))), kd, n, 2) ./ sqrt(Float32(kd))
+        k = reshape(cos.(Float32.(1:(kd*n*2))), kd, n, 2) ./ sqrt(Float32(kd))
+        v = reshape(sin.(Float32.(1:(vd*n*4))), vd, n, 4)
+        state = zeros(Float32, vd, kd)
+        expected_state = copy(state)
+        projected, result = zeros(Float32, vd), zeros(Float32, vd)
+        expected_projected, expected_result = copy(projected), copy(result)
+        saved = (copy(q), copy(k), copy(v))
+        for head in 1:4
+            fill!(state, 0f0); fill!(expected_state, 0f0)
+            for token in 1:n
+                kh = cld(head, 2)
+                factor = token % 3 == 0 ? 0f0 : 0.9f0
+                beta = token % 5 == 0 ? 0f0 : 0.6f0
+                invoke(QDC.cpu_delta_recurrent_step!,
+                    Tuple{Any,Any,Any,Any,Any,Any,Any,Any,Any,Any,Any},
+                    expected_state, expected_projected, expected_result,
+                    q, k, v, beta, factor, token, head, kh)
+                QDC.cpu_delta_recurrent_step!(state, projected, result,
+                    q, k, v, beta, factor, token, head, kh)
+                @test state ≈ expected_state atol=2e-6 rtol=2e-5
+                @test projected ≈ expected_projected atol=2e-6 rtol=2e-5
+                @test result ≈ expected_result atol=2e-6 rtol=2e-5
+            end
+        end
+        fallback_state = copy(state)
+        expected_state = copy(state)
+        invoke(QDC.cpu_delta_recurrent_step!,
+            Tuple{Any,Any,Any,Any,Any,Any,Any,Any,Any,Any,Any},
+            expected_state, expected_projected, expected_result,
+            q, k, v, 0.6f0, 0.9f0, n, 4, 2)
+        QDC.with_cpu_settings(:recurrent_vector_math => false) do
+            QDC.cpu_delta_recurrent_step!(fallback_state, projected, result,
+                q, k, v, 0.6f0, 0.9f0, n, 4, 2)
+        end
+        @test fallback_state == expected_state
+        @test result == expected_result
+        @test (q, k, v) == saved
+    end
+end
+
+@testset "CPU all-token workspace forward equivalence and ownership" begin
+    QDC = QwenDecisionCore
+    b = QwenBackbone(joinpath(@__DIR__, "fixtures", "native"))
+    for n in (1, 9, 65, 129), holes in (false, true)
+        ids = mod.(collect(0:(n-1)), size(b.embedding, 2))
+        mask = ones(Int, n)
+        holes && n > 1 && (mask[1:3:(n-1)] .= 0)
+        saved_ids, saved_mask = copy(ids), copy(mask)
+        hidden = QDC.native_gather(b.embedding, ids)
+        expected = invoke(QDC.native_hidden_states, Tuple{Any,Any,Any,Any,Any},
+            hidden, b.layers, mask, b.final_norm, b.config)
+        for workspace in (false, true), final_only in (false, true)
+            QDC.with_cpu_settings(:mlp_workspace => workspace,
+                                  :final_token_only => final_only) do
+                states = backbone_hidden(b, ids, mask)
+                retained = copy(states)
+                @test size(states) == (b.config.hidden, n)
+                @test states ≈ expected atol=2e-5 rtol=2e-5
+                @test backbone_hidden(b, ids, mask, [1, n]) ≈ expected[:, [1, n]] atol=2e-5 rtol=2e-5
+                tasks = [Threads.@spawn backbone_hidden(b, ids, mask) for _ in 1:2]
+                @test all(isapprox(fetch(t), expected; atol=2e-5, rtol=2e-5) for t in tasks)
+                GC.gc()
+                @test states == retained
+                @test ids == saved_ids && mask == saved_mask
+            end
+        end
+    end
+    hidden = QDC.native_gather(b.embedding, [1, 2, 3])
+    @test QDC.native_hidden_states(hidden, b.layers[1:0], ones(Int, 3),
+                                  b.final_norm, b.config) ≈
+          QDC.native_rms(hidden, b.final_norm, b.config.eps)
+end
+
+@testset "CPU fused four-tap convolution preserves accumulation" begin
+    QDC = QwenDecisionCore
+    for channels in (1, 7, 129), n in (0, 1, 2, 3, 4, 65, 512)
+        input = reshape(sin.(Float32.(1:(channels*n))), channels, n)
+        weight = transpose(reshape(cos.(Float32.(1:(4channels))), channels, 4))
+        initial = copy(input)
+        expected = QDC.with_cpu_settings(:fused_convolution => false) do
+            QDC.cpu_convolution!(copy(initial), input, weight)
+        end
+        actual = QDC.with_cpu_settings(:fused_convolution => true) do
+            QDC.cpu_convolution!(copy(initial), input, weight)
+        end
+        @test isequal(actual, expected)
+        @test input == initial
+    end
+    for value in (0f0, -0f0, Inf32, -Inf32, NaN32, nextfloat(0f0))
+        input = fill(value, 7, 9)
+        weight = transpose(ones(Float32, 7, 4))
+        expected = QDC.with_cpu_settings(:fused_convolution => false) do
+            QDC.cpu_convolution!(zeros(Float32, 7, 9), input, weight)
+        end
+        actual = QDC.with_cpu_settings(:fused_convolution => true) do
+            QDC.cpu_convolution!(zeros(Float32, 7, 9), input, weight)
+        end
+        @test isequal(actual, expected)
+    end
+    input = reshape(sin.(Float32.(1:28)), 7, 4)
+    weight = transpose(ones(Float32, 7, 4))
+    expected = QDC.with_cpu_settings(:fused_convolution => false) do
+        x = copy(input)
+        QDC.cpu_convolution!(x, x, weight)
+    end
+    actual = QDC.with_cpu_settings(:fused_convolution => true) do
+        x = copy(input)
+        QDC.cpu_convolution!(x, x, weight)
+    end
+    @test isequal(actual, expected)
+end
