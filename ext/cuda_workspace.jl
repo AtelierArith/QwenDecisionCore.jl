@@ -10,6 +10,7 @@ mutable struct ForwardWorkspace
     cursor::Int
     one::CUDA.CuVector{Float32,CUDA.DeviceMemory}
     zero::CUDA.CuVector{Float32,CUDA.DeviceMemory}
+    minus_one::CUDA.CuVector{Float32,CUDA.DeviceMemory}
 end
 const WORKSPACES = Dict{UInt,Tuple{WeakRef,ForwardWorkspace}}()
 const WORKSPACE_LOCK = ReentrantLock()
@@ -33,6 +34,7 @@ function workspace(reference)
                 0,
                 CUDA.CuArray{Float32,1,CUDA.DeviceMemory}(Float32[1]),
                 CUDA.CuArray{Float32,1,CUDA.DeviceMemory}(Float32[0]),
+                CUDA.CuArray{Float32,1,CUDA.DeviceMemory}(Float32[-1]),
             )
             WORKSPACES[key] = (WeakRef(reference), owner)
             return owner
@@ -171,10 +173,37 @@ function QwenDecisionCore.native_prepare_mask(reference::CUDA.CuArray, mask)
     return output
 end
 
+# residual = x + mixed and its (centered) RMS normalization in one pass.
+function residual_rms_kernel!(residual, output, x, mixed, weight, width, eps)
+    lane = Int32(CUDA.threadIdx().x)
+    column = Int32(CUDA.blockIdx().x)
+    base = (column-Int32(1))*width
+    total = 0.0f0
+    @inbounds for row = lane:Int32(32):width
+        value = x[row+base]+mixed[row+base]
+        residual[row+base] = value
+        total += value*value
+    end
+    scale = inv(sqrt(warp_sum(total)/Float32(width)+eps))
+    @inbounds for row = lane:Int32(32):width
+        output[row+base] = residual[row+base]*scale*(1.0f0+weight[row])
+    end
+    return
+end
+
 function QwenDecisionCore.native_residual_rms(x::CUDA.CuMatrix{Float32}, mixed, weight, eps)
     residual = scratch(Float32, size(x))
-    residual .= x .+ mixed
-    return residual, QwenDecisionCore.native_rms(residual, weight, eps)
+    output = scratch(Float32, size(x))
+    CUDA.@cuda threads=32 blocks=size(x, 2) residual_rms_kernel!(
+        residual,
+        output,
+        x,
+        mixed,
+        weight,
+        Int32(size(x, 1)),
+        eps,
+    )
+    return residual, output
 end
 
 function QwenDecisionCore.native_hidden_forward(
@@ -194,8 +223,24 @@ function QwenDecisionCore.native_hidden_forward(
         buffers = (scratch(Float32, size(hidden)), scratch(Float32, size(hidden)))
         root_slots, root_cursor = owner.active_slots, owner.cursor
         for (index, layer) in enumerate(layers)
-            owner.active_slots = get!(()->Any[], owner.layer_slots, layer.attention.kind)
+            last_only =
+                index == length(layers) &&
+                layer.attention.kind == :full &&
+                hasproperty(layer.attention, :packed_projection)
+            # The one-column final layer keeps its own slots so their shapes
+            # do not alternate with the full-sequence layers of the same kind.
+            slots_key = last_only ? :last_token : layer.attention.kind
+            owner.active_slots = get!(()->Any[], owner.layer_slots, slots_key)
             owner.cursor = 0
+            if last_only
+                try
+                    hidden = last_token_layer(layer, hidden, mask, cfg)
+                finally
+                    owner.active_slots, owner.cursor = root_slots, root_cursor
+                end
+                # Read before any later forward can reuse these slots.
+                return QwenDecisionCore.native_rms(hidden, final_norm, cfg.eps)
+            end
             destination = buffers[isodd(index) ? 1 : 2]
             try
                 result = QwenDecisionCore.native_layer(layer, hidden, mask, cfg)

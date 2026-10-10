@@ -87,35 +87,71 @@ function delta_recurrent_kernel!(
     return
 end
 
-function causal_depthwise_kernel!(output, input, weight, channels, tokens, taps)
-    index =
-        (Int32(CUDA.blockIdx().x)-Int32(1))*Int32(CUDA.blockDim().x) +
-        Int32(CUDA.threadIdx().x)
-    if index <= channels*tokens
-        channel = rem(index-Int32(1), channels)+Int32(1)
-        token = (index-Int32(1)) ÷ channels + Int32(1)
-        value = 0.0f0
-        @inbounds for tap = Int32(1):taps
-            source = token - (taps-tap)
-            if source >= 1
-                value += input[channel, source] * weight[tap, channel]
-            end
-        end
-        output[channel, token] = QwenDecisionCore.native_silu(value)
+# Per (head, token) column: RMS-normalize the delta output (uncentered weight)
+# and gate it with silu(z), where z is a row block of `projected`.
+function rms_gate_kernel!(gated, output, weight, projected, z_offset, dim, heads, eps)
+    lane = Int32(CUDA.threadIdx().x)
+    column = Int32(CUDA.blockIdx().x)
+    base = (column-Int32(1))*dim
+    head = rem(column-Int32(1), heads)
+    token = (column-Int32(1)) ÷ heads + Int32(1)
+    total = 0.0f0
+    @inbounds for row = lane:Int32(32):dim
+        value = output[row+base]
+        total += value*value
+    end
+    scale = inv(sqrt(warp_sum(total)/Float32(dim)+eps))
+    @inbounds for row = lane:Int32(32):dim
+        z = projected[z_offset+head*dim+row, token]
+        gated[row+base] = output[row+base]*scale*weight[row]*QwenDecisionCore.native_silu(z)
     end
     return
 end
 
+const CONV_TOKENS = 8
+
+# Thread = one channel over CONV_TOKENS consecutive tokens, so each input is
+# loaded once per window instead of once per tap.
+function causal_depthwise_kernel!(output, input, weight, channels, tokens, ::Val{TAPS}) where {TAPS}
+    channel = (Int32(CUDA.blockIdx().x)-Int32(1))*Int32(CUDA.blockDim().x) + Int32(CUDA.threadIdx().x)
+    first = (Int32(CUDA.blockIdx().y)-Int32(1))*Int32(CONV_TOKENS)
+    channel <= channels || return
+    @inbounds begin
+        taps = ntuple(tap -> weight[tap, channel], Val(TAPS))
+        window = ntuple(Val(TAPS - 1)) do lag
+            source = first - Int32(TAPS - 1) + Int32(lag)
+            source >= Int32(1) ? input[channel, source] : 0.0f0
+        end
+        for t = Int32(1):Int32(CONV_TOKENS)
+            token = first + t
+            token <= tokens || break
+            current = input[channel, token]
+            values = (window..., current)
+            value = 0.0f0
+            for tap = 1:TAPS
+                value += values[tap] * taps[tap]
+            end
+            output[channel, token] = QwenDecisionCore.native_silu(value)
+            window = Base.tail(values)
+        end
+    end
+    return
+end
 
 function QwenDecisionCore.causal_depthwise(input::CUDA.StridedCuMatrix{Float32}, weight)
     output = scratch(Float32, size(input))
-    CUDA.@cuda threads=256 blocks=cld(length(input), 256) causal_depthwise_kernel!(
+    # A leading row block is indexed through its parent (same leading
+    # dimension); SubArray indexing roughly halves the kernel's speed.
+    source =
+        input isa SubArray && first(parentindices(input)[1]) == 1 &&
+        parentindices(input)[2] == axes(parent(input), 2) ? parent(input) : input
+    CUDA.@cuda threads=128 blocks=(cld(size(input, 1), 128), cld(size(input, 2), CONV_TOKENS)) causal_depthwise_kernel!(
         output,
-        input,
+        source,
         weight,
         Int32(size(input, 1)),
         Int32(size(input, 2)),
-        Int32(size(weight, 1)),
+        Val(size(weight, 1)),
     )
     return output
 end
@@ -164,7 +200,32 @@ function QwenDecisionCore.delta_attention(attention, x::CUDA.CuMatrix{Float32}, 
         cfg.value_heads,
         tokens,
     )
-    output = scratch(Float32, (cfg.value_dim, cfg.value_heads, tokens))
+    owner = get(task_local_storage(), WORKSPACE_KEY, nothing)
+    if owner !== nothing && get(ENV, "QDC_CUDA_DELTA", "chunked") != "recurrent"
+        chunks = cld(tokens, DELTA_CHUNK)
+        padded = scratch(Float32, (cfg.value_dim, cfg.value_heads, chunks * DELTA_CHUNK))
+        delta_chunked!(owner::ForwardWorkspace, padded, query, key, mixed, beta, decay, cfg, tokens)
+        # A leading slice of the padded columns is itself a dense CuArray.
+        output = view(padded, :, :, 1:tokens)
+    else
+        output = scratch(Float32, (cfg.value_dim, cfg.value_heads, tokens))
+        launch_delta_recurrent!(output, query, key, mixed, beta, decay, cfg, width, tokens, parts)
+    end
+    gated = scratch(Float32, (cfg.value_dim*cfg.value_heads, tokens))
+    CUDA.@cuda threads=32 blocks=cfg.value_heads*tokens rms_gate_kernel!(
+        gated,
+        output,
+        attention.norm,
+        projected,
+        Int32(qkv_width),
+        Int32(cfg.value_dim),
+        Int32(cfg.value_heads),
+        cfg.eps,
+    )
+    return QwenDecisionCore.native_linear(attention.out, gated)
+end
+
+function launch_delta_recurrent!(output, query, key, mixed, beta, decay, cfg, width, tokens, parts)
     CUDA.@cuda threads=(32, 4) blocks=(cld(cfg.value_dim, 4), cfg.value_heads) delta_recurrent_kernel!(
         output,
         query,
@@ -179,9 +240,5 @@ function QwenDecisionCore.delta_attention(attention, x::CUDA.CuMatrix{Float32}, 
         Int32(tokens),
         parts,
     )
-    normalized = QwenDecisionCore.native_rms(output, attention.norm, cfg.eps; centered = false)
-    gated3 = scratch(Float32, size(normalized))
-    gated3 .= normalized .* QwenDecisionCore.native_silu.(z)
-    gated = reshape(gated3, cfg.value_dim*cfg.value_heads, tokens)
-    return QwenDecisionCore.native_linear(attention.out, gated)
+    return output
 end

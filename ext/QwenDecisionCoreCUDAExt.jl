@@ -25,6 +25,7 @@ end
 
 include("cuda_workspace.jl")
 include("cuda_delta.jl")
+include("cuda_delta_chunked.jl")
 include("cuda_attention.jl")
 include("cuda_mlp.jl")
 
