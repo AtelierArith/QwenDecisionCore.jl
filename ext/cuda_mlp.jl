@@ -4,6 +4,22 @@ struct PackedMLP{M}
 end
 
 function QwenDecisionCore.native_attention_weights(::Val{:cuda}, attention)
+    if attention.kind == :full
+        # One projection instead of three: the narrow K/V products alone run
+        # at a fraction of cuBLAS's throughput.
+        packed = hcat(attention.q, attention.k, attention.v)
+        q = size(attention.q, 2)
+        k = size(attention.k, 2)
+        return merge(
+            attention,
+            (
+                q = view(packed, :, 1:q),
+                k = view(packed, :, (q+1):(q+k)),
+                v = view(packed, :, (q+k+1):size(packed, 2)),
+                packed_projection = packed,
+            ),
+        )
+    end
     attention.kind == :delta || return attention
     packed = hcat(attention.qkv, attention.z, attention.a, attention.b)
     q = size(attention.qkv, 2)
