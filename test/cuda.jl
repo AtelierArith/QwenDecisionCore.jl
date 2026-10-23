@@ -29,3 +29,18 @@ BLAS.set_num_threads(1)
         end
     end
 end
+
+@testset "CUDA graph reuse across tasks and streams" begin
+    path = joinpath(@__DIR__, "fixtures", "native")
+    cpu, gpu = QwenBackbone(path), QwenBackbone(path; device=:cuda)
+    ids = mod.(collect(0:8), size(cpu.embedding, 2))
+    mask = ones(Int, length(ids))
+    for _ in 1:3; backbone_last_hidden(gpu, ids, mask); end
+    inputs = (ids, reverse(ids), ids, reverse(ids))
+    tasks = [Threads.@spawn(backbone_last_hidden(gpu, input, mask)) for input in inputs]
+    for (task, input) in zip(tasks, inputs)
+        @test fetch(task) ≈ backbone_last_hidden(cpu, input, mask) atol=2e-5 rtol=2e-5
+    end
+    extension = Base.get_extension(QDC, :QwenDecisionCoreCUDAExt)
+    @test extension.workspace(gpu.embedding).forward_graph.graph !== nothing
+end
