@@ -39,8 +39,15 @@ function qk_normalize_kernel!(
     return
 end
 
-# Each warp owns one value row; each lane owns PARTS key components of
-# its recurrent state. No heap arrays or global state buffers inside the scan.
+@inline function half_warp_sum(value::Float32)
+    for offset in (8, 4, 2, 1)
+        value += CUDA.shfl_xor_sync(CUDA.FULL_MASK, value, offset)
+    end
+    return value
+end
+
+# Each half warp owns one value row. Two independent rows share a warp,
+# amortizing the shuffle instructions while retaining the state in registers.
 function delta_recurrent_kernel!(
     output,
     query,
@@ -64,22 +71,22 @@ function delta_recurrent_kernel!(
     state = ntuple(_ -> 0.0f0, Val(PARTS))
     @inbounds for token = Int32(1):tokens
         keys = ntuple(Val(PARTS)) do p
-            channel = lane + Int32(32 * (p - 1))
+            channel = lane + Int32(16 * (p - 1))
             channel <= key_dim ? key[channel, key_head, token] : 0.0f0
         end
         queries = ntuple(Val(PARTS)) do p
-            channel = lane + Int32(32 * (p - 1))
+            channel = lane + Int32(16 * (p - 1))
             channel <= key_dim ? query[channel, key_head, token] : 0.0f0
         end
         factor = exp(decay[head, token])
         state = map(s -> s * factor, state)
-        prediction = warp_sum(sum(map(*, state, keys)))
+        prediction = half_warp_sum(sum(map(*, state, keys)))
         value =
             row <= value_dim ? mixed[value_start+(head-Int32(1))*value_dim+row, token] :
             0.0f0
         correction = (value - prediction) * beta[head, token]
         state = map((s, k) -> s + correction*k, state, keys)
-        result = warp_sum(sum(map(*, state, queries)))
+        result = half_warp_sum(sum(map(*, state, queries)))
         if lane == 1 && row <= value_dim
             output[row, head, token] = result
         end
@@ -236,7 +243,7 @@ function QwenDecisionCore.delta_attention(attention, x::CUDA.CuMatrix{Float32}, 
 end
 
 function launch_delta_recurrent!(output, query, key, mixed, beta, decay, cfg, width, tokens, parts)
-    CUDA.@cuda threads=(32, 4) blocks=(cld(cfg.value_dim, 4), cfg.value_heads) delta_recurrent_kernel!(
+    CUDA.@cuda threads=(16, 8) blocks=(cld(cfg.value_dim, 8), cfg.value_heads) delta_recurrent_kernel!(
         output,
         query,
         key,
@@ -248,7 +255,7 @@ function launch_delta_recurrent!(output, query, key, mixed, beta, decay, cfg, wi
         Int32(2width),
         Int32(cfg.value_heads÷cfg.key_heads),
         Int32(tokens),
-        parts,
+        Val(cld(cfg.key_dim, 16)),
     )
     return output
 end

@@ -7,7 +7,7 @@ BLAS.set_num_threads(1)
 @testset "CUDA inference agrees with CPU" begin
     for cpu in (QwenBackbone(joinpath(@__DIR__, "fixtures", "native")), synthetic_backbone())
         gpu = device_backbone(cpu, :cuda)
-        for n in (1, 9, 63, 64, 65, 129), holes in (false, true)
+        for n in (1, 9, 63, 64, 65, 129, 256, 257), holes in (false, true)
             ids = mod.(collect(0:(n-1)), size(cpu.embedding, 2))
             mask = ones(Int, n)
             holes && n > 1 && (mask[1:3:(n-1)] .= 0)

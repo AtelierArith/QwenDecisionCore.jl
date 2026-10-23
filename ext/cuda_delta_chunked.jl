@@ -328,6 +328,10 @@ function delta_chunked!(owner, padded, query, key, mixed, beta, decay, cfg, toke
         width * C,
         batches,
     )
+    if chunks >= 3
+        return delta_chunked_state_packed!(owner, padded, solved, decayed_queries,
+            intra, ending_keys, growths, cfg, chunks)
+    end
     state = scratch(Float32, (dv, dk, heads))
     for chunk = 1:chunks
         base = (chunk - 1) * heads

@@ -87,3 +87,16 @@ layer, shape, math-policy, algorithm, or all-token-path changes. Input uploads
 and host readback remain outside capture. `QDC_CUDA_GRAPH=0` disables recording
 and replay for diagnostics. Cold starts and frequently changing input lengths
 may benefit less than repeated warmed forwards.
+
+A [2026-10-24 revision comparison](results/inference-1thread-cuda-2026-10-24.txt)
+on a Xeon E5-2699 v3 and RTX 3060 passed both 15% gates:
+
+| Backend | Baseline aggregate | Current aggregate | Higher inference speed |
+| --- | ---: | ---: | ---: |
+| CPU, Julia/BLAS one thread | 134.145 ms | 115.953 ms | 15.7% |
+| CUDA, RTX 3060 | 7.599 ms | 6.421 ms | 18.3% |
+
+The baseline is `e8a3db6`. The CPU path also reuses final-query attention
+projections and RoPE tables. For longer CUDA sequences, one wider state product
+replaces separate correction and query products; the packed output is converted
+back to the original token layout before normalization and gating.
