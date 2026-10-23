@@ -86,6 +86,7 @@ function native_full_heads!(out::Matrix{Float32}, q, k, v, qgate, scores_mask, c
     return out
 end
 
+# GEMM outputs and explicitly written head/mask buffers need no zero fill.
 function cpu_full_workspace(cfg, n)
     half = cfg.rotary_dim ÷ 2
     frequencies = inv.(
@@ -93,17 +94,17 @@ function cpu_full_workspace(cfg, n)
     )
     angles = frequencies .* permutedims(Float32.(0:(n-1)))
     return (
-        qgate = zeros(Float32, 2cfg.head_dim * cfg.heads, n),
-        q = zeros(Float32, cfg.head_dim, cfg.heads, n),
-        k = zeros(Float32, cfg.head_dim * cfg.kv_heads, n),
-        v = zeros(Float32, cfg.head_dim * cfg.kv_heads, n),
-        out = zeros(Float32, cfg.head_dim * cfg.heads, n),
-        projected = zeros(Float32, cfg.hidden, n),
-        mask = zeros(Float32, n, n),
+        qgate = Matrix{Float32}(undef, 2cfg.head_dim * cfg.heads, n),
+        q = Array{Float32}(undef, cfg.head_dim, cfg.heads, n),
+        k = Matrix{Float32}(undef, cfg.head_dim * cfg.kv_heads, n),
+        v = Matrix{Float32}(undef, cfg.head_dim * cfg.kv_heads, n),
+        out = Matrix{Float32}(undef, cfg.head_dim * cfg.heads, n),
+        projected = Matrix{Float32}(undef, cfg.hidden, n),
+        mask = Matrix{Float32}(undef, n, n),
         cosines = reshape(cos.(angles), half, n),
         sines = reshape(sin.(angles), half, n),
         heads = [
-            (scores = zeros(Float32, n, n), values = zeros(Float32, cfg.head_dim, n)) for
+            (scores = Matrix{Float32}(undef, n, n), values = Matrix{Float32}(undef, cfg.head_dim, n)) for
             _ = 1:min(Threads.nthreads(:default), cfg.heads)
         ],
     )
@@ -254,10 +255,10 @@ function cpu_mlp_workspace(layers, sequence_length)
     all(layer -> size(layer.mlp.gate, 2) == width, layers) || return nothing
     return (
         full = (
-            zeros(Float32, width, sequence_length),
-            zeros(Float32, width, sequence_length),
+            Matrix{Float32}(undef, width, sequence_length),
+            Matrix{Float32}(undef, width, sequence_length),
         ),
-        final = (zeros(Float32, width, 1), zeros(Float32, width, 1)),
+        final = (Matrix{Float32}(undef, width, 1), Matrix{Float32}(undef, width, 1)),
     )
 end
 
@@ -394,7 +395,7 @@ function cpu_delta_worker_workspace(cfg, sequence_length)
     tail_size = mod(sequence_length, chunk_size)
     tail =
         tail_size == 0 || tail_size == full_size ? full : cpu_delta_buffers(cfg, tail_size)
-    return (; state = zeros(Float32, cfg.value_dim, cfg.key_dim), full, tail)
+    return (; state = Matrix{Float32}(undef, cfg.value_dim, cfg.key_dim), full, tail)
 end
 
 function cpu_delta_workspace(cfg, sequence_length)
@@ -426,18 +427,18 @@ function cpu_delta_projection_workspace(cfg, n)
     key_width = cfg.key_dim * cfg.key_heads
     value_width = cfg.value_dim * cfg.value_heads
     return (
-        masked = zeros(Float32, cfg.hidden, n),
-        qkv = zeros(Float32, 2key_width+value_width, n),
-        mixed = zeros(Float32, 2key_width+value_width, n),
-        q = zeros(Float32, cfg.key_dim, n, cfg.key_heads),
-        k = zeros(Float32, cfg.key_dim, n, cfg.key_heads),
-        v = zeros(Float32, cfg.value_dim, n, cfg.value_heads),
-        z = zeros(Float32, value_width, n),
-        gate = zeros(Float32, cfg.value_dim, n, cfg.value_heads),
-        beta = zeros(Float32, cfg.value_heads, n),
-        decay = zeros(Float32, cfg.value_heads, n),
-        out = zeros(Float32, value_width, n),
-        projected = zeros(Float32, cfg.hidden, n),
+        masked = Matrix{Float32}(undef, cfg.hidden, n),
+        qkv = Matrix{Float32}(undef, 2key_width+value_width, n),
+        mixed = Matrix{Float32}(undef, 2key_width+value_width, n),
+        q = Array{Float32}(undef, cfg.key_dim, n, cfg.key_heads),
+        k = Array{Float32}(undef, cfg.key_dim, n, cfg.key_heads),
+        v = Array{Float32}(undef, cfg.value_dim, n, cfg.value_heads),
+        z = Matrix{Float32}(undef, value_width, n),
+        gate = Array{Float32}(undef, cfg.value_dim, n, cfg.value_heads),
+        beta = Matrix{Float32}(undef, cfg.value_heads, n),
+        decay = Matrix{Float32}(undef, cfg.value_heads, n),
+        out = Matrix{Float32}(undef, value_width, n),
+        projected = Matrix{Float32}(undef, cfg.hidden, n),
     )
 end
 
@@ -699,6 +700,8 @@ function cpu_delta_recurrent_step!(
     return nothing
 end
 
+cpu_delta_tiled_scan!(out, q, k, v, beta, decay, head, kh) = false
+
 function cpu_delta_recurrent_heads!(
     heads,
     out,
@@ -721,6 +724,17 @@ function cpu_delta_recurrent_heads!(
     for head in heads
         fill!(state, 0.0f0)
         kh = cld(head, groups)
+        if cpu_delta_tiled_scan!(out, q, k, v, beta, decay, head, kh)
+            offset = (head - 1) * cfg.value_dim
+            for token in axes(out, 2)
+                values = @view out[(offset+1):(offset+cfg.value_dim), token]
+                scale = inv(sqrt(sum(abs2, values) / cfg.value_dim + cfg.eps))
+                @inbounds @simd for row = 1:cfg.value_dim
+                    values[row] = ((values[row] * scale) * attention.norm[row]) * z[row, token, head]
+                end
+            end
+            continue
+        end
         for token in axes(out, 2)
             factor = exp(decay[head, token])
             cpu_delta_recurrent_step!(
@@ -830,6 +844,40 @@ function cpu_hidden_forward_scoped(hidden, layers, mask, final_norm, cfg; all_to
                native_rms(hidden[:, end:end], final_norm, cfg.eps) :
                native_rms(hidden, final_norm, cfg.eps)[:, end:end]
     end
+    if !cpu_setting(:reuse_workspace)
+        return cpu_hidden_with_resources(hidden, layers, mask, final_norm, cfg,
+            cpu_forward_resources(hidden, layers, cfg, all_tokens), all_tokens)
+    end
+    # Each task owns one bounded scratch set, with no model weights retained.
+    # Nested forwards get independent scratch and cannot overwrite an outer call.
+    key = (size(hidden), cfg, cpu_settings(), all_tokens,
+           Tuple(size(layer.mlp.gate, 2) for layer in layers),
+           Tuple(layer.attention.kind for layer in layers))
+    cached = get(task_local_storage(), :qdc_cpu_workspace, nothing)
+    nested = cached !== nothing && cached.busy
+    if cached === nothing || cached.key != key || nested
+        cached = CPUForwardScratch(key, cpu_forward_resources(hidden, layers, cfg, all_tokens), false)
+        if !nested
+            task_local_storage(:qdc_cpu_workspace, cached)
+        end
+    end
+    cached.busy = true
+    try
+        result = cpu_hidden_with_resources(hidden, layers, mask, final_norm, cfg, cached.resources, all_tokens)
+        # All-token normalization may be the reusable workspace itself.
+        return all_tokens && cached.resources.normalization !== nothing ? copy(result) : result
+    finally
+        cached.busy = false
+    end
+end
+
+mutable struct CPUForwardScratch
+    key::Any
+    resources::Any
+    busy::Bool
+end
+
+function cpu_forward_resources(hidden, layers, cfg, all_tokens)
     workspace = cpu_mlp_workspace(layers, size(hidden, 2))
     delta_buffers = cpu_delta_workspace(cfg, size(hidden, 2))
     projections = cpu_delta_projection_workspace(cfg, size(hidden, 2))
@@ -840,9 +888,16 @@ function cpu_hidden_forward_scoped(hidden, layers, mask, final_norm, cfg; all_to
             residual = similar(hidden),
             attention = cpu_full_workspace(
                 cfg,
-                any(layer -> layer.attention.kind == :full, layers) ? size(hidden, 2) : 0,
+                any(layer -> layer.attention.kind == :full,
+                    all_tokens || !cpu_setting(:final_token_only) || !cpu_setting(:final_query) ?
+                    layers : @view(layers[1:(end-1)])) ? size(hidden, 2) : 0,
             ),
         ) : nothing
+    return (; workspace, delta_buffers, projections, normalization)
+end
+
+function cpu_hidden_with_resources(hidden, layers, mask, final_norm, cfg, resources, all_tokens)
+    (; workspace, delta_buffers, projections, normalization) = resources
     if workspace === nothing
         if delta_buffers === nothing
             return cpu_hidden_forward(

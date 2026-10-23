@@ -246,4 +246,44 @@ function QwenDecisionCore.cpu_delta_recurrent_step!(
     return nothing
 end
 
+# Value rows evolve independently. A dense 32-row state tile fits in L1 for
+# production key widths and stays there across the sequence. Normalize only
+# after every tile has written its rows of the unnormalized output.
+function QwenDecisionCore.cpu_delta_tiled_scan!(
+    out::Matrix{Float32}, q::Array{Float32,3}, k::Array{Float32,3},
+    v::Array{Float32,3}, beta, decay, head, kh,
+)
+    QwenDecisionCore.cpu_setting(:recurrent_vector_math) || return false
+    rows = size(v, 1)
+    rows >= 32 && rows % 32 == 0 && 32 <= size(k, 1) <= 128 && size(out, 2) >= 16 || return false
+    factors = exp.(@view decay[head, :])
+    tile = Matrix{Float32}(undef, 32, size(k, 1))
+    projected = Vector{Float32}(undef, 32)
+    offset = (head - 1) * rows
+    for first in 0:32:(rows-1)
+        fill!(tile, 0.0f0)
+        for token in axes(out, 2)
+            factor = factors[token]
+            gate = beta[head, token]
+            @turbo for row in 1:32
+                value = 0.0f0
+                for column in axes(tile, 2)
+                    value += tile[row, column] * k[column, token, kh]
+                end
+                projected[row] = gate * (v[first+row, token, head] - factor * value)
+            end
+            @turbo for row in 1:32
+                value = 0.0f0
+                for column in axes(tile, 2)
+                    updated = factor * tile[row, column] + projected[row] * k[column, token, kh]
+                    tile[row, column] = updated
+                    value += updated * q[column, token, kh]
+                end
+                out[offset+first+row, token] = value
+            end
+        end
+    end
+    return true
+end
+
 end

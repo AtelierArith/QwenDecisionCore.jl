@@ -1,5 +1,5 @@
 # Automatic, immutable CPU policy. Overrides are internal diagnostic scopes,
-# not environment-variable configuration or mutable backend caches.
+# not environment-variable configuration or shared model caches.
 function cpu_defaults(apple::Bool)
     portable = !apple
     return (
@@ -21,6 +21,7 @@ function cpu_defaults(apple::Bool)
         mlp_residual_fusion = portable,
         parallel_heads = true,
         mlp_workspace = true,
+        reuse_workspace = true,
         trim_padding = true,
         inplace_delta_rms = portable,
         simd = false,

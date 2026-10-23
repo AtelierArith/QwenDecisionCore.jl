@@ -11,6 +11,7 @@ mutable struct ForwardWorkspace
     one::CUDA.CuVector{Float32,CUDA.DeviceMemory}
     zero::CUDA.CuVector{Float32,CUDA.DeviceMemory}
     minus_one::CUDA.CuVector{Float32,CUDA.DeviceMemory}
+    forward_graph::Any
 end
 const WORKSPACES = Dict{UInt,Tuple{WeakRef,ForwardWorkspace}}()
 const WORKSPACE_LOCK = ReentrantLock()
@@ -35,6 +36,7 @@ function workspace(reference)
                 CUDA.CuArray{Float32,1,CUDA.DeviceMemory}(Float32[1]),
                 CUDA.CuArray{Float32,1,CUDA.DeviceMemory}(Float32[0]),
                 CUDA.CuArray{Float32,1,CUDA.DeviceMemory}(Float32[-1]),
+                nothing,
             )
             WORKSPACES[key] = (WeakRef(reference), owner)
             return owner
@@ -206,7 +208,59 @@ function QwenDecisionCore.native_residual_rms(x::CUDA.CuMatrix{Float32}, mixed, 
     return residual, output
 end
 
+# The generic all-token path uses root slots in a different order. Any graph
+# recorded against those slots must be discarded before they can be replaced.
+function QwenDecisionCore.native_hidden_states(
+    hidden::CUDA.CuMatrix{Float32}, layers, mask, final_norm, cfg,
+)
+    owner = get(task_local_storage(), WORKSPACE_KEY, nothing)
+    owner === nothing || (owner.forward_graph = nothing)
+    return invoke(QwenDecisionCore.native_hidden_states,
+        Tuple{Any,Any,Any,Any,Any}, hidden, layers, mask, final_norm, cfg)
+end
+
+# Capture only device computation. Input copies/gather and the owned host
+# readback remain outside the graph. One graph per workspace bounds memory;
+# shape, layer identities and diagnostic algorithm changes invalidate it.
 function QwenDecisionCore.native_hidden_forward(
+    hidden::CUDA.CuMatrix{Float32}, layers, mask, final_norm, cfg,
+)
+    owner = get(task_local_storage(), WORKSPACE_KEY, nothing)
+    owner === nothing && return cuda_hidden_forward(hidden, layers, mask, final_norm, cfg)
+    owner = owner::ForwardWorkspace
+    if get(ENV, "QDC_CUDA_GRAPH", "1") == "0"
+        owner.forward_graph = nothing
+        return cuda_hidden_forward(hidden, layers, mask, final_norm, cfg)
+    end
+    key = (Tuple(objectid(layer) for layer in layers), objectid(hidden),
+           objectid(mask), objectid(final_norm), cfg, CUDA.math_mode(), CUDA.math_precision(),
+           get(ENV, "QDC_CUDA_DELTA", "chunked"))
+    cached = owner.forward_graph
+    if cached === nothing || cached.key != key
+        result = cuda_hidden_forward(hidden, layers, mask, final_norm, cfg)
+        owner.forward_graph = (; key, graph=nothing, result, cursor=owner.cursor, handle=CUDA.CUBLAS.handle())
+        return result
+    end
+    if cached.graph === nothing
+        start = owner.cursor
+        result = Ref{Any}()
+        graph = CUDA.capture(; throw_error=false) do
+            result[] = cuda_hidden_forward(hidden, layers, mask, final_norm, cfg)
+        end
+        if graph === nothing
+            owner.cursor = start
+            return cuda_hidden_forward(hidden, layers, mask, final_norm, cfg)
+        end
+        executable = CUDA.instantiate(graph)
+        cached = (; key, graph=executable, result=result[], cursor=owner.cursor, handle=CUDA.CUBLAS.handle())
+        owner.forward_graph = cached
+    end
+    CUDA.launch(cached.graph)
+    owner.cursor = cached.cursor
+    return cached.result
+end
+
+function cuda_hidden_forward(
     hidden::CUDA.CuMatrix{Float32},
     layers,
     mask,

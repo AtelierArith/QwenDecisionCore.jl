@@ -156,6 +156,23 @@ function QwenDecisionCore.causal_depthwise(input::CUDA.StridedCuMatrix{Float32},
     return output
 end
 
+# Both narrow gate projections share packed rows; avoid two broadcast launches
+# and their strided SubArray indexing.
+function delta_gates_kernel!(beta, decay, projected, a_decay, dt_bias, start, heads, tokens)
+    index = (Int32(CUDA.blockIdx().x)-Int32(1))*Int32(CUDA.blockDim().x) + Int32(CUDA.threadIdx().x)
+    if index <= heads*tokens
+        head = rem(index-Int32(1), heads)+Int32(1)
+        token = (index-Int32(1))÷heads+Int32(1)
+        @inbounds begin
+            a = projected[start+head, token] + dt_bias[head]
+            b = projected[start+heads+head, token]
+            beta[index] = QwenDecisionCore.native_sigmoid(b)
+            decay[index] = a_decay[head]*QwenDecisionCore.native_softplus(a)
+        end
+    end
+    return
+end
+
 function QwenDecisionCore.delta_attention(attention, x::CUDA.CuMatrix{Float32}, mask, cfg)
     cfg.key_dim <= 256 || return invoke(
         QwenDecisionCore.delta_attention,
@@ -188,20 +205,14 @@ function QwenDecisionCore.delta_attention(attention, x::CUDA.CuMatrix{Float32}, 
         Int32(tokens),
         parts,
     )
-    b = view(projected, (qkv_width+z_width+a_width+1):size(projected, 1), :)
-    beta = scratch(Float32, size(b))
-    beta .= QwenDecisionCore.native_sigmoid.(b)
-    a = view(projected, (qkv_width+z_width+1):(qkv_width+z_width+a_width), :)
-    decay = scratch(Float32, size(a))
-    decay .= attention.a_decay .* QwenDecisionCore.native_softplus.(a .+ attention.dt_bias)
-    z = reshape(
-        view(projected, (qkv_width+1):(qkv_width+z_width), :),
-        cfg.value_dim,
-        cfg.value_heads,
-        tokens,
+    beta = scratch(Float32, (cfg.value_heads, tokens))
+    decay = scratch(Float32, size(beta))
+    CUDA.@cuda threads=128 blocks=cld(length(beta), 128) delta_gates_kernel!(
+        beta, decay, projected, attention.a_decay, attention.dt_bias,
+        Int32(qkv_width+z_width), Int32(cfg.value_heads), Int32(tokens),
     )
     owner = get(task_local_storage(), WORKSPACE_KEY, nothing)
-    if owner !== nothing && get(ENV, "QDC_CUDA_DELTA", "chunked") != "recurrent"
+    if owner !== nothing && tokens > 64 && get(ENV, "QDC_CUDA_DELTA", "chunked") != "recurrent"
         chunks = cld(tokens, DELTA_CHUNK)
         padded = scratch(Float32, (cfg.value_dim, cfg.value_heads, chunks * DELTA_CHUNK))
         delta_chunked!(owner::ForwardWorkspace, padded, query, key, mixed, beta, decay, cfg, tokens)
