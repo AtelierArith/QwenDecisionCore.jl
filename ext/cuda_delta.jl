@@ -189,7 +189,6 @@ function QwenDecisionCore.delta_attention(attention, x::CUDA.CuMatrix{Float32}, 
     projected = QwenDecisionCore.native_linear(attention.packed_projection, masked)
     qkv_width = size(attention.qkv, 2)
     z_width = size(attention.z, 2)
-    a_width = size(attention.a, 2)
     mixed = QwenDecisionCore.causal_depthwise(view(projected, 1:qkv_width, :), attention.conv)
     query = scratch(Float32, (cfg.key_dim, cfg.key_heads, tokens))
     key = scratch(Float32, size(query))

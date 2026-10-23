@@ -676,3 +676,27 @@ end
     tasks = [Threads.@spawn(backbone_hidden(b, ids, mask)) for _ in 1:2]
     @test all(fetch(t) == first for t in tasks)
 end
+
+@testset "CPU final-query workspace overwrite and RoPE" begin
+    QDC = QwenDecisionCore
+    b = QwenBackbone(joinpath(@__DIR__, "fixtures", "native"))
+    attention = last(b.layers).attention
+    saved_weights = deepcopy(attention)
+    for n in (1, 17, 65), rotary_dim in (0, 2, 4)
+        cfg = merge(b.config, (; rotary_dim))
+        input = reshape(sin.(Float32.(1:(cfg.hidden*n))), cfg.hidden, n)
+        saved = copy(input)
+        buffers = QDC.cpu_final_full_workspace(cfg, n)
+        for mask in (ones(Int, n), Int.(isodd.(1:n)))
+            for name in (:qgate, :q, :k, :v, :out, :projected, :scores, :values)
+                fill!(getproperty(buffers, name), NaN32)
+            end
+            expected = QDC.cpu_final_full_attention(attention, input, mask, cfg)
+            actual = QDC.cpu_final_full_attention(attention, input, mask, cfg, buffers)
+            @test actual === buffers.projected
+            @test actual ≈ expected atol=2e-6 rtol=2e-6
+            @test input == saved
+            @test attention == saved_weights
+        end
+    end
+end

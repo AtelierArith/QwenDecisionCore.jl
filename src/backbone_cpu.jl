@@ -886,6 +886,8 @@ function cpu_forward_resources(hidden, layers, cfg, all_tokens)
         (;
             normalized = similar(hidden),
             residual = similar(hidden),
+            final_attention = !all_tokens && cpu_setting(:final_query) &&
+                last(layers).attention.kind == :full ? cpu_final_full_workspace(cfg, size(hidden, 2)) : nothing,
             attention = cpu_full_workspace(
                 cfg,
                 any(layer -> layer.attention.kind == :full,
@@ -952,6 +954,61 @@ function cpu_hidden_with_resources(hidden, layers, mask, final_norm, cfg, resour
         normalization,
         all_tokens,
     )
+end
+
+function cpu_final_full_workspace(cfg, n)
+    half = cfg.rotary_dim ÷ 2
+    frequencies = inv.(cfg.rope_theta .^ (Float32.(0:2:(cfg.rotary_dim-1)) ./ Float32(cfg.rotary_dim)))
+    angles = frequencies .* permutedims(Float32.(0:(n-1)))
+    return (;
+        qgate = Matrix{Float32}(undef, 2cfg.head_dim * cfg.heads, 1),
+        q = Array{Float32}(undef, cfg.head_dim, cfg.heads, 1),
+        k = Matrix{Float32}(undef, cfg.head_dim * cfg.kv_heads, n),
+        v = Matrix{Float32}(undef, cfg.head_dim * cfg.kv_heads, n),
+        out = Matrix{Float32}(undef, cfg.head_dim * cfg.heads, 1),
+        projected = Matrix{Float32}(undef, cfg.hidden, 1),
+        scores = Matrix{Float32}(undef, n, 1),
+        values = Matrix{Float32}(undef, cfg.head_dim, 1),
+        cosines = reshape(cos.(angles), half, n),
+        sines = reshape(sin.(angles), half, n),
+    )
+end
+
+cpu_final_full_attention(attention, x, mask, cfg, ::Nothing) =
+    cpu_final_full_attention(attention, x, mask, cfg)
+
+# Final-query attention keeps K/V over the context, but uses only one query.
+# Reuse its projections, RoPE tables, scores and per-head values across calls.
+function cpu_final_full_attention(attention, x, mask, cfg, buffers)
+    n = size(x, 2)
+    cpu_projection!(buffers.qgate, attention.q, @view(x[:, end:end]))
+    qgate = reshape(buffers.qgate, 2cfg.head_dim, cfg.heads, 1)
+    cpu_full_rms!(buffers.q, @view(qgate[1:cfg.head_dim, :, :]), attention.q_norm, cfg.eps)
+    cpu_full_rope!(buffers.q, @view(buffers.cosines[:, end:end]), @view(buffers.sines[:, end:end]))
+    cpu_projection!(buffers.k, attention.k, x)
+    k = reshape(buffers.k, cfg.head_dim, cfg.kv_heads, n)
+    cpu_full_rms!(k, k, attention.k_norm, cfg.eps)
+    cpu_full_rope!(k, buffers.cosines, buffers.sines)
+    cpu_projection!(buffers.v, attention.v, x)
+    v = reshape(buffers.v, cfg.head_dim, cfg.kv_heads, n)
+    groups = cfg.heads ÷ cfg.kv_heads
+    for head in 1:cfg.heads
+        kv = cld(head, groups)
+        scores = buffers.scores
+        mul!(scores, transpose(@view(k[:, kv, :])), @view(buffers.q[:, head, :]))
+        @inbounds for token in 1:n
+            scores[token] = scores[token] / sqrt(Float32(cfg.head_dim)) +
+                (mask[token] == 1 ? 0f0 : -floatmax(Float32))
+        end
+        if !cpu_portable_softmax!(scores)
+            scores .= exp.(scores .- maximum(scores))
+            scores ./= sum(scores)
+        end
+        mul!(buffers.values, @view(v[:, kv, :]), scores)
+        @views buffers.out[((head-1)*cfg.head_dim+1):(head*cfg.head_dim), :] .=
+            buffers.values .* native_sigmoid.(qgate[(cfg.head_dim+1):end, head, :])
+    end
+    return cpu_projection!(buffers.projected, attention.out, buffers.out)
 end
 
 function cpu_final_full_attention(attention, x, mask, cfg)
@@ -1049,7 +1106,8 @@ function cpu_hidden_forward(
         layer.attention.kind == :full ?
         (
             cpu_setting(:final_query) ?
-            cpu_final_full_attention(layer.attention, normalized, mask, cfg) :
+            cpu_final_full_attention(layer.attention, normalized, mask, cfg,
+                normalization === nothing ? nothing : normalization.final_attention) :
             cpu_full_attention(
                 layer.attention,
                 normalized,
