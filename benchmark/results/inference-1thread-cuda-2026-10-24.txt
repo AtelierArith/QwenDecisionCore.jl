@@ -1,0 +1,63 @@
+Warmed inference revision comparison, 2026-10-24 (Asia/Tokyo)
+Baseline: e8a3db6 (the main revision before PR #7)
+Current: PR #7, including final-query CPU scratch and packed CUDA state reads
+Julia: 1.13.2; Julia default threads: 1; BLAS threads: 1
+CPU: Intel Xeon E5-2699 v3; OpenBLAS 0.3.30; LoopVectorization 0.12.174
+GPU: NVIDIA GeForce RTX 3060; CUDA.jl 6.4.2; driver 580.178.04
+CUDA comparison environments both use LoopVectorization 0.12.175.
+
+Workload: existing deterministic 4-layer hybrid synthetic backbone,
+hidden=256, intermediate=512, Delta key/value dimensions=128, batch=1.
+Public backbone_last_hidden, including input preparation and owned host output.
+Lengths 64/128/256/512, 4 warm forwards then 21 samples per length,
+GC before each timed forward; compilation and initial cache construction excluded.
+Baseline and current measurements ran sequentially with no concurrent local tests.
+Aggregate = sum of per-length medians. Speedup = 100*(baseline/current-1).
+Every output checked with atol=2e-5, rtol=2e-5.
+
+CPU aggregate: 134.144949 ms -> 115.952651 ms, 15.6894% faster.
+CUDA aggregate: 7.598823 ms -> 6.421419 ms, 18.3356% faster.
+These results apply to this warmed synthetic workload and hardware, not every
+checkpoint, input length, cold start, or GPU backend. Metal/AMDGPU not measured.
+
+CPU baseline
+Julia=1.13.2; Julia threads=1; BLAS threads=1; device=cpu; checkpoint=
+(tokens = 64, median_ms = 12.261436)
+(tokens = 128, median_ms = 19.895141000000002)
+(tokens = 256, median_ms = 35.046184000000004)
+(tokens = 512, median_ms = 66.942188)
+(aggregate_ms = 134.144949,)
+
+CPU current
+Julia=1.13.2; Julia threads=1; BLAS threads=1; device=cpu; checkpoint=
+(tokens = 64, max_error = 5.9604645f-7)
+(tokens = 64, median_ms = 10.732621)
+(tokens = 128, max_error = 5.9604645f-7)
+(tokens = 128, median_ms = 17.530829)
+(tokens = 256, max_error = 4.172325f-7)
+(tokens = 256, median_ms = 30.585244)
+(tokens = 512, max_error = 3.5762787f-7)
+(tokens = 512, median_ms = 57.103956999999994)
+(aggregate_ms = 115.95265099999999,)
+(speedup_percent = 15.689419640780788,)
+
+CUDA baseline
+Julia=1.13.2; Julia threads=1; BLAS threads=1; device=cuda; checkpoint=
+(tokens = 64, median_ms = 1.2064860000000002)
+(tokens = 128, median_ms = 1.3287399999999998)
+(tokens = 256, median_ms = 1.828619)
+(tokens = 512, median_ms = 3.234978)
+(aggregate_ms = 7.598822999999999,)
+
+CUDA current
+Julia=1.13.2; Julia threads=1; BLAS threads=1; device=cuda; checkpoint=
+(tokens = 64, max_error = 1.692772f-5)
+(tokens = 64, median_ms = 0.924724)
+(tokens = 128, max_error = 0.0f0)
+(tokens = 128, median_ms = 1.0811)
+(tokens = 256, max_error = 0.0f0)
+(tokens = 256, median_ms = 1.623837)
+(tokens = 512, max_error = 0.0f0)
+(tokens = 512, median_ms = 2.791758)
+(aggregate_ms = 6.421419,)
+(speedup_percent = 18.335573492400957,)

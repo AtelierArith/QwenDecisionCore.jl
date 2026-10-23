@@ -617,3 +617,86 @@ end
     end
     @test isequal(actual, expected)
 end
+
+@testset "CPU tiled Delta scan matches scalar recurrence" begin
+    QDC = QwenDecisionCore
+    for (vd, kd, n) in ((32, 32, 16), (64, 63, 65), (128, 128, 129))
+        q = reshape(sin.(Float32.(1:(kd*n*2))), kd, n, 2) ./ sqrt(Float32(kd))
+        k = reshape(cos.(Float32.(1:(kd*n*2))), kd, n, 2) ./ sqrt(Float32(kd))
+        v = reshape(sin.(Float32.(1:(vd*n*4))), vd, n, 4)
+        beta = fill(0.6f0, 4, n)
+        beta[:, 1:5:n] .= 0f0
+        decay = fill(-0.1f0, 4, n)
+        decay[:, 1:7:n] .= -100f0
+        output = fill(NaN32, vd*4, n)
+        expected = similar(output)
+        state, projected, result = zeros(Float32, vd, kd), zeros(Float32, vd), zeros(Float32, vd)
+        for head in 1:4
+            fill!(state, 0f0)
+            kh = cld(head, 2)
+            for token in 1:n
+                invoke(QDC.cpu_delta_recurrent_step!,
+                    Tuple{Any,Any,Any,Any,Any,Any,Any,Any,Any,Any,Any},
+                    state, projected, result, q, k, v, beta[head, token],
+                    exp(decay[head, token]), token, head, kh)
+                expected[(head-1)*vd+1:head*vd, token] .= result
+            end
+            @test QDC.cpu_delta_tiled_scan!(output, q, k, v, beta, decay, head, kh)
+        end
+        @test output ≈ expected atol=2e-6 rtol=2e-5
+        @test !QDC.with_cpu_settings(:recurrent_vector_math => false) do
+            QDC.cpu_delta_tiled_scan!(output, q, k, v, beta, decay, 1, 1)
+        end
+    end
+end
+
+@testset "CPU task scratch reuse, isolation and nested calls" begin
+    QDC = QwenDecisionCore
+    b = QwenBackbone(joinpath(@__DIR__, "fixtures", "native"))
+    ids, mask = mod.(collect(0:64), size(b.embedding, 2)), ones(Int, 65)
+    expected = QDC.with_cpu_settings(:reuse_workspace => false) do
+        backbone_hidden(b, ids, mask)
+    end
+    first = backbone_hidden(b, ids, mask)
+    cached = task_local_storage()[:qdc_cpu_workspace]
+    second = backbone_hidden(b, ids, mask)
+    @test task_local_storage()[:qdc_cpu_workspace] === cached
+    @test first == second
+    @test first ≈ expected atol=2e-5 rtol=2e-5
+    second .= NaN32
+    @test backbone_hidden(b, ids, mask) == first
+    @test first ≈ expected atol=2e-5 rtol=2e-5
+    cached.busy = true
+    try
+        @test backbone_hidden(b, ids, mask) == first
+        @test task_local_storage()[:qdc_cpu_workspace] === cached
+    finally
+        cached.busy = false
+    end
+    tasks = [Threads.@spawn(backbone_hidden(b, ids, mask)) for _ in 1:2]
+    @test all(fetch(t) == first for t in tasks)
+end
+
+@testset "CPU final-query workspace overwrite and RoPE" begin
+    QDC = QwenDecisionCore
+    b = QwenBackbone(joinpath(@__DIR__, "fixtures", "native"))
+    attention = last(b.layers).attention
+    saved_weights = deepcopy(attention)
+    for n in (1, 17, 65), rotary_dim in (0, 2, 4)
+        cfg = merge(b.config, (; rotary_dim))
+        input = reshape(sin.(Float32.(1:(cfg.hidden*n))), cfg.hidden, n)
+        saved = copy(input)
+        buffers = QDC.cpu_final_full_workspace(cfg, n)
+        for mask in (ones(Int, n), Int.(isodd.(1:n)))
+            for name in (:qgate, :q, :k, :v, :out, :projected, :scores, :values)
+                fill!(getproperty(buffers, name), NaN32)
+            end
+            expected = QDC.cpu_final_full_attention(attention, input, mask, cfg)
+            actual = QDC.cpu_final_full_attention(attention, input, mask, cfg, buffers)
+            @test actual === buffers.projected
+            @test actual ≈ expected atol=2e-6 rtol=2e-6
+            @test input == saved
+            @test attention == saved_weights
+        end
+    end
+end

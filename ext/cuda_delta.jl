@@ -39,8 +39,15 @@ function qk_normalize_kernel!(
     return
 end
 
-# Each warp owns one value row; each lane owns PARTS key components of
-# its recurrent state. No heap arrays or global state buffers inside the scan.
+@inline function half_warp_sum(value::Float32)
+    for offset in (8, 4, 2, 1)
+        value += CUDA.shfl_xor_sync(CUDA.FULL_MASK, value, offset)
+    end
+    return value
+end
+
+# Each half warp owns one value row. Two independent rows share a warp,
+# amortizing the shuffle instructions while retaining the state in registers.
 function delta_recurrent_kernel!(
     output,
     query,
@@ -64,22 +71,22 @@ function delta_recurrent_kernel!(
     state = ntuple(_ -> 0.0f0, Val(PARTS))
     @inbounds for token = Int32(1):tokens
         keys = ntuple(Val(PARTS)) do p
-            channel = lane + Int32(32 * (p - 1))
+            channel = lane + Int32(16 * (p - 1))
             channel <= key_dim ? key[channel, key_head, token] : 0.0f0
         end
         queries = ntuple(Val(PARTS)) do p
-            channel = lane + Int32(32 * (p - 1))
+            channel = lane + Int32(16 * (p - 1))
             channel <= key_dim ? query[channel, key_head, token] : 0.0f0
         end
         factor = exp(decay[head, token])
         state = map(s -> s * factor, state)
-        prediction = warp_sum(sum(map(*, state, keys)))
+        prediction = half_warp_sum(sum(map(*, state, keys)))
         value =
             row <= value_dim ? mixed[value_start+(head-Int32(1))*value_dim+row, token] :
             0.0f0
         correction = (value - prediction) * beta[head, token]
         state = map((s, k) -> s + correction*k, state, keys)
-        result = warp_sum(sum(map(*, state, queries)))
+        result = half_warp_sum(sum(map(*, state, queries)))
         if lane == 1 && row <= value_dim
             output[row, head, token] = result
         end
@@ -156,6 +163,23 @@ function QwenDecisionCore.causal_depthwise(input::CUDA.StridedCuMatrix{Float32},
     return output
 end
 
+# Both narrow gate projections share packed rows; avoid two broadcast launches
+# and their strided SubArray indexing.
+function delta_gates_kernel!(beta, decay, projected, a_decay, dt_bias, start, heads, tokens)
+    index = (Int32(CUDA.blockIdx().x)-Int32(1))*Int32(CUDA.blockDim().x) + Int32(CUDA.threadIdx().x)
+    if index <= heads*tokens
+        head = rem(index-Int32(1), heads)+Int32(1)
+        token = (index-Int32(1))÷heads+Int32(1)
+        @inbounds begin
+            a = projected[start+head, token] + dt_bias[head]
+            b = projected[start+heads+head, token]
+            beta[index] = QwenDecisionCore.native_sigmoid(b)
+            decay[index] = a_decay[head]*QwenDecisionCore.native_softplus(a)
+        end
+    end
+    return
+end
+
 function QwenDecisionCore.delta_attention(attention, x::CUDA.CuMatrix{Float32}, mask, cfg)
     cfg.key_dim <= 256 || return invoke(
         QwenDecisionCore.delta_attention,
@@ -172,7 +196,6 @@ function QwenDecisionCore.delta_attention(attention, x::CUDA.CuMatrix{Float32}, 
     projected = QwenDecisionCore.native_linear(attention.packed_projection, masked)
     qkv_width = size(attention.qkv, 2)
     z_width = size(attention.z, 2)
-    a_width = size(attention.a, 2)
     mixed = QwenDecisionCore.causal_depthwise(view(projected, 1:qkv_width, :), attention.conv)
     query = scratch(Float32, (cfg.key_dim, cfg.key_heads, tokens))
     key = scratch(Float32, size(query))
@@ -188,20 +211,14 @@ function QwenDecisionCore.delta_attention(attention, x::CUDA.CuMatrix{Float32}, 
         Int32(tokens),
         parts,
     )
-    b = view(projected, (qkv_width+z_width+a_width+1):size(projected, 1), :)
-    beta = scratch(Float32, size(b))
-    beta .= QwenDecisionCore.native_sigmoid.(b)
-    a = view(projected, (qkv_width+z_width+1):(qkv_width+z_width+a_width), :)
-    decay = scratch(Float32, size(a))
-    decay .= attention.a_decay .* QwenDecisionCore.native_softplus.(a .+ attention.dt_bias)
-    z = reshape(
-        view(projected, (qkv_width+1):(qkv_width+z_width), :),
-        cfg.value_dim,
-        cfg.value_heads,
-        tokens,
+    beta = scratch(Float32, (cfg.value_heads, tokens))
+    decay = scratch(Float32, size(beta))
+    CUDA.@cuda threads=128 blocks=cld(length(beta), 128) delta_gates_kernel!(
+        beta, decay, projected, attention.a_decay, attention.dt_bias,
+        Int32(qkv_width+z_width), Int32(cfg.value_heads), Int32(tokens),
     )
     owner = get(task_local_storage(), WORKSPACE_KEY, nothing)
-    if owner !== nothing && get(ENV, "QDC_CUDA_DELTA", "chunked") != "recurrent"
+    if owner !== nothing && tokens > 64 && get(ENV, "QDC_CUDA_DELTA", "chunked") != "recurrent"
         chunks = cld(tokens, DELTA_CHUNK)
         padded = scratch(Float32, (cfg.value_dim, cfg.value_heads, chunks * DELTA_CHUNK))
         delta_chunked!(owner::ForwardWorkspace, padded, query, key, mixed, beta, decay, cfg, tokens)
@@ -226,7 +243,7 @@ function QwenDecisionCore.delta_attention(attention, x::CUDA.CuMatrix{Float32}, 
 end
 
 function launch_delta_recurrent!(output, query, key, mixed, beta, decay, cfg, width, tokens, parts)
-    CUDA.@cuda threads=(32, 4) blocks=(cld(cfg.value_dim, 4), cfg.value_heads) delta_recurrent_kernel!(
+    CUDA.@cuda threads=(16, 8) blocks=(cld(cfg.value_dim, 8), cfg.value_heads) delta_recurrent_kernel!(
         output,
         query,
         key,
@@ -238,7 +255,7 @@ function launch_delta_recurrent!(output, query, key, mixed, beta, decay, cfg, wi
         Int32(2width),
         Int32(cfg.value_heads÷cfg.key_heads),
         Int32(tokens),
-        parts,
+        Val(cld(cfg.key_dim, 16)),
     )
     return output
 end
