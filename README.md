@@ -1,6 +1,6 @@
 # QwenDecisionCore.jl
 
-Shared, dependency-light core for native-Julia decision models built on
+Shared core for native-Julia decision models built on
 Qwen3.5 / Qwen3.8 hybrid backbones. It owns
 
 - the backbone forward pass (partial RoPE, full attention, Gated DeltaNet,
@@ -65,3 +65,10 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 The suite is offline: it checks the backbone against a committed PyTorch
 reference with tiny fixtures, the safetensors round trip, the Hub resolver
 against a `file://` endpoint, and the CPU policies and workspaces.
+
+On Intel x86-64 Linux/Windows, inference with one Julia thread and one BLAS
+thread uses a private sequential MKL SGEMM for supported Float32 projections.
+`MKL_jll` is loaded lazily at the first eligible projection; accelerator-only
+execution does not load it. This does not redirect libblastrampoline or change
+the selected BLAS library. Each call restores MKL's thread-local thread limit.
+Other hardware, layouts, and unavailable-library cases retain the portable path.

@@ -700,3 +700,81 @@ end
         end
     end
 end
+
+@testset "Private single-thread SGEMM preserves BLAS and local thread policy" begin
+    QDC = QwenDecisionCore
+    BLAS = LinearAlgebra.BLAS
+    original_threads = BLAS.get_num_threads()
+    libraries = [(lib.libname,lib.interface) for lib in BLAS.get_config().loaded_libs]
+    try
+        BLAS.set_num_threads(1)
+        weight = reshape(sin.(Float32.(1:2048)),64,32)
+        input = reshape(cos.(Float32.(1:448)),64,7)
+        for transposed in (false,true), beta in (0f0,1f0,-0.5f0)
+            w = transposed ? transpose(permutedims(weight)) : weight
+            initial = fill(0.25f0,32,7)
+            expected = QDC.with_cpu_settings(:mkl_serial=>false) do
+                QDC.cpu_projection!(copy(initial),w,input,beta)
+            end
+            actual = QDC.cpu_projection!(copy(initial),w,input,beta)
+            @test actual ≈ expected atol=2e-5 rtol=2e-5
+        end
+        @test BLAS.get_num_threads() == 1
+        @test [(lib.libname,lib.interface) for lib in BLAS.get_config().loaded_libs] == libraries
+        if Threads.nthreads(:default) == 1 && QDC.cpu_setting(:mkl_serial)
+            @test QDC.CPU_MKL_GEMM[] != C_NULL
+            setter = QDC.CPU_MKL_THREADS[]
+            getter = QDC.Libdl.dlsym(QDC.CPU_MKL_HANDLE[], :MKL_Get_Max_Threads)
+            previous = ccall(setter,Cint,(Cint,),2)
+            try
+                QDC.cpu_projection!(zeros(Float32,32,7),weight,input)
+                @test ccall(getter,Cint,()) == 2
+            finally
+                ccall(setter,Cint,(Cint,),previous)
+            end
+        end
+    finally
+        BLAS.set_num_threads(original_threads)
+    end
+end
+
+@testset "SIMD delta output normalization and gating" begin
+    QDC = QwenDecisionCore
+    for n in (1,17,129)
+        width,heads = 128,4
+        raw = reshape(sin.(Float32.(1:(width*heads*n))),width*heads,n)
+        z = reshape(cos.(Float32.(1:(width*heads*n))),width,n,heads)
+        weight = cos.(Float32.(1:width))
+        actual, expected = copy(raw), copy(raw)
+        for head in 1:heads, token in 1:n
+            rows = ((head-1)*width+1):(head*width)
+            values = @view expected[rows,token]
+            scale = inv(sqrt(sum(abs2,values)/width+1f-6))
+            values .= ((values.*scale).*weight).*z[:,token,head]
+        end
+        for head in 1:heads
+            @test QDC.cpu_delta_gate_output!(actual,z,weight,1f-6,head)
+        end
+        @test actual ≈ expected atol=2e-6 rtol=2e-5
+    end
+end
+
+@testset "Narrow SIMD projections agree with BLAS" begin
+    QDC = QwenDecisionCore
+    original = LinearAlgebra.BLAS.get_num_threads()
+    try
+        LinearAlgebra.BLAS.set_num_threads(1)
+        for rows in (1,2,4), n in (16,65), beta in (0f0,1f0,-0.5f0)
+            weight = reshape(sin.(Float32.(1:(64rows))),64,rows)
+            input = reshape(cos.(Float32.(1:(64n))),64,n)
+            initial = fill(0.25f0,rows,n)
+            expected = transpose(weight)*input+beta*initial
+            actual = QDC.cpu_projection!(copy(initial),weight,input,beta)
+            @test actual ≈ expected atol=2e-5 rtol=2e-5
+            handled = QDC.cpu_small_projection!(copy(initial),weight,input,beta)
+            @test handled == (Threads.nthreads(:default) == 1 && QDC.cpu_setting(:portable_vector_math))
+        end
+    finally
+        LinearAlgebra.BLAS.set_num_threads(original)
+    end
+end

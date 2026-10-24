@@ -1,7 +1,7 @@
 """
     QwenDecisionCore
 
-Shared, dependency-light core for native-Julia decision models built on
+Shared core for native-Julia decision models built on
 Qwen3.5 / Qwen3.8 hybrid backbones. It owns the backbone forward pass
 (partial RoPE, full attention, Gated DeltaNet, RMS normalization, MLP), the
 safetensors loader, Hugging Face checkpoint resolution, the CPU policy, the
@@ -14,6 +14,7 @@ module QwenDecisionCore
 
 import Downloads
 import JSON
+import Libdl
 import Scratch
 using LinearAlgebra
 import LoopVectorization
@@ -31,7 +32,11 @@ include("hub.jl")
 include("cpu_settings.jl")
 include("backbone.jl")
 include("backbone_cpu.jl")
+include("cpu_mkl.jl")
 
-__init__() = initialize_cpu!()
+function __init__()
+    reset_cpu_mkl!()
+    initialize_cpu!()
+end
 
 end # module QwenDecisionCore

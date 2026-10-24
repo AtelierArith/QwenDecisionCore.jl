@@ -3,6 +3,9 @@ struct PackedMLP{M}
     down::M
 end
 
+# Store projection rows contiguously so inference uses cuBLAS NN products.
+cuda_projection_storage(weight) = transpose(permutedims(weight))
+
 function QwenDecisionCore.native_attention_weights(::Val{:cuda}, attention)
     if attention.kind == :full
         # One projection instead of three: the narrow K/V products alone run
@@ -21,24 +24,26 @@ function QwenDecisionCore.native_attention_weights(::Val{:cuda}, attention)
         )
     end
     attention.kind == :delta || return attention
-    packed = hcat(attention.qkv, attention.z, attention.a, attention.b)
+    packed = cuda_projection_storage(hcat(attention.qkv, attention.z, attention.a, attention.b))
+    storage = parent(packed)
     q = size(attention.qkv, 2)
     z = size(attention.z, 2)
     a = size(attention.a, 2)
     return merge(
         attention,
         (
-            qkv = view(packed, :, 1:q),
-            z = view(packed, :, (q+1):(q+z)),
-            a = view(packed, :, (q+z+1):(q+z+a)),
-            b = view(packed, :, (q+z+a+1):size(packed, 2)),
+            qkv = transpose(view(storage, 1:q, :)),
+            z = transpose(view(storage, (q+1):(q+z), :)),
+            a = transpose(view(storage, (q+z+1):(q+z+a), :)),
+            b = transpose(view(storage, (q+z+a+1):size(storage, 1), :)),
+            out = cuda_projection_storage(attention.out),
             packed_projection = packed,
         ),
     )
 end
 
 function QwenDecisionCore.native_mlp_weights(::Val{:cuda}, gate, up, down)
-    return PackedMLP(hcat(gate, up), down)
+    return PackedMLP(cuda_projection_storage(hcat(gate, up)), cuda_projection_storage(down))
 end
 
 function mlp_gate_kernel!(output, packed, width, tokens)

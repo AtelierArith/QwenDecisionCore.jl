@@ -44,3 +44,50 @@ end
     extension = Base.get_extension(QDC, :QwenDecisionCoreCUDAExt)
     @test extension.workspace(gpu.embedding).forward_graph.graph !== nothing
 end
+
+@testset "CUDA I/O graph and diagnostic fallback preserve inputs" begin
+    path = joinpath(@__DIR__,"fixtures","native")
+    cpu,gpu = QwenBackbone(path),QwenBackbone(path;device=:cuda)
+    ids,mask = mod.(collect(0:64),size(cpu.embedding,2)),ones(Int,65)
+    mask[1:3:64] .= 0
+    saved = (copy(ids),copy(mask))
+    expected = backbone_last_hidden(cpu,ids,mask)
+    for mode in ("1","0","1")
+        withenv("QDC_CUDA_GRAPH"=>mode) do
+            for _ in 1:3
+                @test backbone_last_hidden(gpu,ids,mask) ≈ expected atol=2e-5 rtol=2e-5
+            end
+            cache = Base.get_extension(QDC,:QwenDecisionCoreCUDAExt).workspace(gpu.embedding).forward_graph
+            @test mode == "0" ? cache === nothing : cache.graph isa CUDA.CuGraphExec
+        end
+    end
+    @test (ids,mask) == saved
+end
+
+@testset "CUDA shared-state chunks with 64-wide keys" begin
+    source = synthetic_backbone()
+    cfg = merge(source.config,(;key_dim=64))
+    width = 2cfg.key_dim*cfg.key_heads+cfg.value_dim*cfg.value_heads
+    layers = map(source.layers) do layer
+        attention = layer.attention
+        if attention.kind == :delta
+            attention = Base.structdiff(attention,(;packed_projection=nothing))
+            attention = merge(attention,(;
+                qkv=copy(attention.qkv[:,1:width]),
+                conv=transpose(copy(parent(attention.conv)[1:width,:]))))
+            attention = QDC.native_attention_weights(Val(:cpu),attention)
+        end
+        QDC.QwenLayer(attention,layer.mlp,layer.input_norm,layer.post_norm)
+    end
+    cpu = QwenBackbone(source.embedding,Vector{Union{unique(typeof.(layers))...}}(layers),source.final_norm,cfg)
+    gpu = device_backbone(cpu,:cuda)
+    for n in (65,129,257)
+        ids,mask = mod.(collect(0:(n-1)),256),ones(Int,n)
+        mask[1:3:(n-1)] .= 0
+        expected = backbone_hidden(cpu,ids,mask)
+        @test backbone_hidden(gpu,ids,mask) ≈ expected atol=2e-5 rtol=2e-5
+        for _ in 1:3
+            @test backbone_last_hidden(gpu,ids,mask) ≈ expected[:,end] atol=2e-5 rtol=2e-5
+        end
+    end
+end

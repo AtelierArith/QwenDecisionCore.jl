@@ -4,6 +4,9 @@ function cpu_defaults(apple::Bool)
     portable = !apple
     return (
         accelerate = apple,
+        mkl_serial = !apple && Sys.ARCH === :x86_64 &&
+            (Sys.islinux() || Sys.iswindows()) &&
+            any(info -> occursin("Intel", info.model), Sys.cpu_info()),
         vector_math = apple,
         portable_vector_math = portable,
         vector_math_blocks = true,

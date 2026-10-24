@@ -30,6 +30,10 @@ for n in (64, 128, 256, 512)
     f() = operation(b, ids, mask)
     result = f()
     for _ in 1:3; f(); end
+    if device == :cpu && n == 64
+        mkl = isdefined(QDC, :CPU_MKL_GEMM) && QDC.CPU_MKL_GEMM[] != C_NULL
+        println((; projection_backend=mkl ? :mkl_serial : :blas))
+    end
     if baseline !== nothing
         expected = Float32.(baseline["results"][length(results)+1]["output"])
         @assert baseline["results"][length(results)+1]["tokens"] == n

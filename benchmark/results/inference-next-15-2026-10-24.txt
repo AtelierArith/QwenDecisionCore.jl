@@ -1,0 +1,76 @@
+Second warmed inference revision comparison, 2026-10-24 (Asia/Tokyo)
+Baseline: f6a26ee1f487b8accfad625b963ca801849be155 (main after PR #7)
+Current: perf/inference-next-15
+Julia: 1.13.2; Julia default threads: 1; BLAS threads: 1
+CPU: Intel Xeon E5-2699 v3; OpenBLAS 0.3.30 baseline; private MKL 2025.2 current
+CPU comparison uses taskset -c 8 for BOTH revisions, run consecutively.
+LoopVectorization: CPU 0.12.174; both CUDA environments 0.12.175
+GPU: NVIDIA GeForce RTX 3060; CUDA.jl 6.4.2; driver 580.178.04
+
+Unchanged deterministic 4-layer hybrid synthetic backbone, hidden=256,
+intermediate=512, Delta key/value dimensions=128, batch=1.
+Public backbone_last_hidden, including input preparation and owned host output.
+Lengths 64/128/256/512, 4 warm forwards then 21 samples per length,
+GC before each timed forward; compilation and initial cache construction excluded.
+No concurrent benchmarks or tests from this work ran during these measurements.
+Aggregate = sum of per-length medians. Speedup = 100*(baseline/current-1).
+Every output checked with atol=2e-5, rtol=2e-5; precision remains Float32.
+
+CPU aggregate: 116.942129 ms -> 100.912999 ms; 15.8841% faster.
+CUDA aggregate: 6.385967 ms -> 5.526512 ms; 15.5515% faster.
+
+These results apply to this warmed synthetic workload and hardware. They do not
+promise 15% for every length, checkpoint, cold start, CPU or GPU backend.
+Metal and AMDGPU performance was not measured. The new MKL_jll dependency is
+loaded lazily only by eligible Intel x86-64 single-thread CPU projections.
+It does not redirect libblastrampoline; the MKL thread-local limit is restored.
+
+Reproduce CPU (same core for both):
+taskset -c 8 julia --project=/path/to/f6a26ee -t1 benchmark/inference.jl --output /tmp/cpu-before.json
+taskset -c 8 julia --project=. -t1 benchmark/inference.jl --baseline /tmp/cpu-before.json --require-speedup 15
+See benchmark/README.md for the two CUDA environments and reproduction commands.
+
+CPU baseline
+Julia=1.13.2; Julia threads=1; BLAS threads=1; device=cpu; checkpoint=
+(projection_backend = :blas,)
+(tokens = 64, median_ms = 11.205926)
+(tokens = 128, median_ms = 17.579572000000002)
+(tokens = 256, median_ms = 30.813222)
+(tokens = 512, median_ms = 57.343409)
+(aggregate_ms = 116.942129,)
+
+CPU current
+Julia=1.13.2; Julia threads=1; BLAS threads=1; device=cpu; checkpoint=
+(projection_backend = :mkl_serial,)
+(tokens = 64, max_error = 1.4483929f-5)
+(tokens = 64, median_ms = 7.956736000000001)
+(tokens = 128, max_error = 1.21593475f-5)
+(tokens = 128, median_ms = 14.234402)
+(tokens = 256, max_error = 7.6293945f-6)
+(tokens = 256, median_ms = 27.098396)
+(tokens = 512, max_error = 5.4836273f-6)
+(tokens = 512, median_ms = 51.623465)
+(aggregate_ms = 100.91299900000001,)
+(speedup_percent = 15.884108250513872,)
+
+CUDA baseline
+Julia=1.13.2; Julia threads=1; BLAS threads=1; device=cuda; checkpoint=
+(tokens = 64, median_ms = 0.9237380000000001)
+(tokens = 128, median_ms = 1.0599830000000001)
+(tokens = 256, median_ms = 1.6165489999999998)
+(tokens = 512, median_ms = 2.7856970000000003)
+(aggregate_ms = 6.385967000000001,)
+
+CUDA current
+Julia=1.13.2; Julia threads=1; BLAS threads=1; device=cuda; checkpoint=
+(tokens = 64, max_error = 8.404255f-6)
+(tokens = 64, median_ms = 0.8453449999999999)
+(tokens = 128, max_error = 5.8040023f-6)
+(tokens = 128, median_ms = 0.97476)
+(tokens = 256, max_error = 3.5464764f-6)
+(tokens = 256, median_ms = 1.422873)
+(tokens = 512, max_error = 2.026558f-6)
+(tokens = 512, median_ms = 2.283534)
+(aggregate_ms = 5.526512,)
+(speedup_percent = 15.551490705168124,)
+

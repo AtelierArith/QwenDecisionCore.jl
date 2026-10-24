@@ -205,6 +205,8 @@ function cpu_full_attention(attention, x, mask, cfg, buffers)
     return cpu_projection!(buffers.projected, attention.out, buffers.out)
 end
 
+cpu_small_projection!(output, weight, input, beta) = false
+
 function cpu_projection!(output, weight, input, beta = 0.0f0)
     size(input, 1) == size(weight, 1) &&
     size(output) == (size(weight, 2), size(input, 2)) ||
@@ -217,6 +219,8 @@ function cpu_projection!(output, weight, input, beta = 0.0f0)
         output .= product .+ beta .* output
         return output
     end
+    cpu_small_projection!(output, weight, input, beta) && return output
+    cpu_mkl_projection!(output, weight, input, beta) && return output
     workers = min(Threads.nthreads(:default), size(output, 1))
     if !cpu_setting(:parallel_projections) ||
        workers == 1 ||
@@ -414,9 +418,9 @@ function cpu_normalize_delta_heads!(values::Array{Float32,3}, multiplier::Float3
         @inbounds @simd for row in axes(values, 1)
             squared += abs2(values[row, head, token])
         end
-        denominator = sqrt(squared + 1.0f-6) * multiplier
+        scale = inv(sqrt(squared + 1.0f-6) * multiplier)
         @inbounds @simd for row in axes(values, 1)
-            values[row, head, token] /= denominator
+            values[row, head, token] *= scale
         end
     end
     return values
@@ -701,6 +705,7 @@ function cpu_delta_recurrent_step!(
 end
 
 cpu_delta_tiled_scan!(out, q, k, v, beta, decay, head, kh) = false
+cpu_delta_gate_output!(out, z, weight, eps, head) = false
 
 function cpu_delta_recurrent_heads!(
     heads,
@@ -722,19 +727,21 @@ function cpu_delta_recurrent_heads!(
     projected = @view owned.full.corrections[:, 1]
     result = @view owned.full.result[:, 1]
     for head in heads
-        fill!(state, 0.0f0)
         kh = cld(head, groups)
         if cpu_delta_tiled_scan!(out, q, k, v, beta, decay, head, kh)
-            offset = (head - 1) * cfg.value_dim
-            for token in axes(out, 2)
-                values = @view out[(offset+1):(offset+cfg.value_dim), token]
-                scale = inv(sqrt(sum(abs2, values) / cfg.value_dim + cfg.eps))
-                @inbounds @simd for row = 1:cfg.value_dim
-                    values[row] = ((values[row] * scale) * attention.norm[row]) * z[row, token, head]
+            if !cpu_delta_gate_output!(out, z, attention.norm, cfg.eps, head)
+                offset = (head - 1) * cfg.value_dim
+                for token in axes(out, 2)
+                    values = @view out[(offset+1):(offset+cfg.value_dim), token]
+                    scale = inv(sqrt(sum(abs2, values) / cfg.value_dim + cfg.eps))
+                    @inbounds @simd for row = 1:cfg.value_dim
+                        values[row] = ((values[row] * scale) * attention.norm[row]) * z[row, token, head]
+                    end
                 end
             end
             continue
         end
+        fill!(state, 0.0f0)
         for token in axes(out, 2)
             factor = exp(decay[head, token])
             cpu_delta_recurrent_step!(
