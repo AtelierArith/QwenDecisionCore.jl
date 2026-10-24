@@ -6,8 +6,10 @@ authors = ["Satoshi Terasaki <terasakisatoshi.math@gmail.com>"]
 [deps]
 Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
+MKL_jll = "856f044c-d86e-5d09-b602-aeab76dc8ba7"
 Scratch = "6c6a2e73-6563-6170-7368-637461726353"
 
 [compat]
@@ -18,6 +20,7 @@ Downloads = "1.7.0"
 JSON = "1.10.0"
 LinearAlgebra = "1.13.0"
 LoopVectorization = "0.12.174"
+MKL_jll = "2025.2.0"
 Metal = "=1.11.1"
 Octavian = "0.3.29"
 SIMD = "3.7"

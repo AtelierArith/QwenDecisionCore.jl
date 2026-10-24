@@ -53,7 +53,15 @@ native_mlp_weights(device, gate, up, down) = (; gate, up, down)
 native_conv_weights(device, weight) = weight
 native_attention_weights(device, attention) = attention
 native_gather(embedding, ids) = embedding[:, on_native_device(embedding, Int32.(ids .+ 1))]
-native_gather(embedding::Matrix, ids) = embedding[:, ids .+ 1]
+function native_gather(embedding::Matrix, ids)
+    width = size(embedding, 1)
+    hidden = Matrix{eltype(embedding)}(undef, width, length(ids))
+    for (column, id) in enumerate(ids)
+        checkbounds(embedding, :, id+1)
+        copyto!(hidden, (column-1)*width+1, embedding, Int(id)*width+1, width)
+    end
+    return hidden
+end
 
 # Optional batched forward. The core processes one sequence per call; an
 # accelerator extension may override this to return final-normalized hidden

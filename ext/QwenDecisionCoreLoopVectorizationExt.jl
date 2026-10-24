@@ -246,9 +246,34 @@ function QwenDecisionCore.cpu_delta_recurrent_step!(
     return nothing
 end
 
-# Value rows evolve independently. A dense 32-row state tile fits in L1 for
-# production key widths and stays there across the sequence. Normalize only
-# after every tile has written its rows of the unnormalized output.
+# Four-row gate projections are cheaper as dot products than as packed GEMMs.
+function QwenDecisionCore.cpu_small_projection!(output::Matrix{Float32}, weight::Matrix{Float32}, input::Matrix{Float32}, beta)
+    QwenDecisionCore.cpu_setting(:portable_vector_math) &&
+        Threads.nthreads(:default) == 1 && QwenDecisionCore.cpu_projection_blas_threads() == 1 &&
+        1 <= size(output,1) <= 4 && size(input,1) >= 64 && size(input,2) >= 16 || return false
+    if iszero(beta)
+        @turbo for token in axes(output,2), row in axes(output,1)
+            value = 0f0
+            for inner in axes(input,1)
+                value += weight[inner,row]*input[inner,token]
+            end
+            output[row,token] = value
+        end
+    else
+        @turbo for token in axes(output,2), row in axes(output,1)
+            value = 0f0
+            for inner in axes(input,1)
+                value += weight[inner,row]*input[inner,token]
+            end
+            output[row,token] = value+beta*output[row,token]
+        end
+    end
+    return true
+end
+
+# Two-token updates read each L1-resident state tile twice instead of four
+# times. Shared key/query dot products account for the first token's rank-one
+# update when predicting the second; an odd tail uses the original recurrence.
 function QwenDecisionCore.cpu_delta_tiled_scan!(
     out::Matrix{Float32}, q::Array{Float32,3}, k::Array{Float32,3},
     v::Array{Float32,3}, beta, decay, head, kh,
@@ -256,31 +281,109 @@ function QwenDecisionCore.cpu_delta_tiled_scan!(
     QwenDecisionCore.cpu_setting(:recurrent_vector_math) || return false
     rows = size(v, 1)
     rows >= 32 && rows % 32 == 0 && 32 <= size(k, 1) <= 128 && size(out, 2) >= 16 || return false
-    factors = exp.(@view decay[head, :])
-    tile = Matrix{Float32}(undef, 32, size(k, 1))
-    projected = Vector{Float32}(undef, 32)
+    n = size(out, 2)
+    # SIMD exp is accurate in the ordinary decay range. Keep scalar exp for
+    # subnormals and exceptional values before deciding whether to fall back.
+    factors = Vector{Float32}(undef, n)
+    if decay isa Matrix{Float32} && all(d -> -80f0 <= d <= 0f0, @view(decay[head,:]))
+        @turbo for token in 1:n
+            factors[token] = exp(decay[head,token])
+        end
+    else
+        factors .= exp.(@view decay[head,:])
+    end
+    pairs = n ÷ 2
+    products = Matrix{Float32}(undef, 4, pairs)
+    for pair in 1:pairs
+        t = 2pair-1
+        f1,f2 = factors[t],factors[t+1]
+        if !isfinite(f1) || !isfinite(f2) || f1 > 1f0 || f2 > 1f0 ||
+            (f1 > 0f0 && f2 > 0f0 && iszero(f1*f2))
+            return false
+        end
+        kk, kq1, kq2, k2q2 = 0f0, 0f0, 0f0, 0f0
+        @turbo for column in axes(k, 1)
+            a, b = k[column, t, kh], k[column, t+1, kh]
+            kk += a*b
+            kq1 += a*q[column, t, kh]
+            kq2 += a*q[column, t+1, kh]
+            k2q2 += b*q[column, t+1, kh]
+        end
+        @inbounds begin
+            products[1,pair] = kk
+            products[2,pair] = kq1
+            products[3,pair] = kq2
+            products[4,pair] = k2q2
+        end
+    end
+    tile = Matrix{Float32}(undef, 16, size(k, 1))
+    p1, p2 = Vector{Float32}(undef, 16), Vector{Float32}(undef, 16)
     offset = (head - 1) * rows
-    for first in 0:32:(rows-1)
-        fill!(tile, 0.0f0)
-        for token in axes(out, 2)
-            factor = factors[token]
-            gate = beta[head, token]
-            @turbo for row in 1:32
-                value = 0.0f0
+    for first in 0:16:(rows-1)
+        fill!(tile, 0f0)
+        for pair in 1:pairs
+            t = 2pair-1
+            f1, f2 = factors[t], factors[t+1]
+            f12 = f1*f2
+            b1, b2 = beta[head, t], beta[head, t+1]
+            kk, kq1, kq2, k2q2 = products[1,pair], products[2,pair], products[3,pair], products[4,pair]
+            @turbo for row in 1:16
+                sk1, sk2, sq1, sq2 = 0f0, 0f0, 0f0, 0f0
                 for column in axes(tile, 2)
-                    value += tile[row, column] * k[column, token, kh]
+                    value = tile[row, column]
+                    sk1 += value*k[column, t, kh]
+                    sk2 += value*k[column, t+1, kh]
+                    sq1 += value*q[column, t, kh]
+                    sq2 += value*q[column, t+1, kh]
                 end
-                projected[row] = gate * (v[first+row, token, head] - factor * value)
+                c1 = b1*(v[first+row, t, head]-f1*sk1)
+                c2 = b2*(v[first+row, t+1, head]-f2*(f1*sk2+c1*kk))
+                p1[row] = f2*c1
+                p2[row] = c2
+                out[offset+first+row, t] = f1*sq1+c1*kq1
+                out[offset+first+row, t+1] = f12*sq2+f2*c1*kq2+c2*k2q2
             end
-            @turbo for row in 1:32
-                value = 0.0f0
+            @turbo for column in axes(tile, 2), row in 1:16
+                tile[row, column] = f12*tile[row, column] + p1[row]*k[column, t, kh] + p2[row]*k[column, t+1, kh]
+            end
+        end
+        if isodd(n)
+            factor, gate = factors[n], beta[head, n]
+            @turbo for row in 1:16
+                value = 0f0
                 for column in axes(tile, 2)
-                    updated = factor * tile[row, column] + projected[row] * k[column, token, kh]
+                    value += tile[row, column]*k[column, n, kh]
+                end
+                p1[row] = gate*(v[first+row, n, head]-factor*value)
+            end
+            @turbo for row in 1:16
+                value = 0f0
+                for column in axes(tile, 2)
+                    updated = factor*tile[row, column]+p1[row]*k[column, n, kh]
                     tile[row, column] = updated
-                    value += updated * q[column, token, kh]
+                    value += updated*q[column, n, kh]
                 end
-                out[offset+first+row, token] = value
+                out[offset+first+row, n] = value
             end
+        end
+    end
+    return true
+end
+
+function QwenDecisionCore.cpu_delta_gate_output!(out::Matrix{Float32}, z::Array{Float32,3}, weight::AbstractVector{Float32}, eps, head)
+    QwenDecisionCore.cpu_setting(:recurrent_vector_math) || return false
+    LoopVectorization.check_args(weight) || return false
+    width = size(z,1)
+    width > 0 && size(out,2) > 0 || return false
+    offset = (head-1)*width
+    for token in axes(out,2)
+        squared = 0f0
+        @turbo for row in 1:width
+            squared += abs2(out[offset+row,token])
+        end
+        scale = inv(sqrt(squared/width+eps))
+        @turbo for row in 1:width
+            out[offset+row,token] = ((out[offset+row,token]*scale)*weight[row])*z[row,token,head]
         end
     end
     return true

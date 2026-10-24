@@ -27,7 +27,9 @@ include("cuda_workspace.jl")
 include("cuda_delta.jl")
 include("cuda_delta_chunked.jl")
 include("cuda_delta_state.jl")
+include("cuda_delta_hybrid.jl")
 include("cuda_attention.jl")
 include("cuda_mlp.jl")
+include("cuda_io_graph.jl")
 
 end

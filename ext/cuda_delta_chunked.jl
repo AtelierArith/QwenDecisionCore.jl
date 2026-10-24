@@ -167,7 +167,7 @@ end
 #   intra[s, t] = exp(G_t - G_s) k_s'q_t (s <= t), zero otherwise.
 # The inverse is blocked: diagonal DELTA_BLOCK blocks by forward substitution,
 # then each block row as T_ij = -T_ii * sum_k L_ik T_kj.
-function delta_chunk_inverse_kernel!(inverse, intra, products, cumulative, gates)
+function delta_chunk_inverse_kernel!(inverse, intra, products, cumulative, gates, intra_offset = Int32(0))
     C = Int32(DELTA_CHUNK)
     S = Int32(DELTA_BLOCK)
     thread = Int32(CUDA.threadIdx().x)
@@ -189,7 +189,7 @@ function delta_chunk_inverse_kernel!(inverse, intra, products, cumulative, gates
             s = (e - Int32(1)) ÷ C + Int32(1)
             system[i, s] =
                 s < i ? betas[i] * exp(logs[i] - logs[s]) * products[i, s, batch] : 0.0f0
-            intra[i, s, batch] =
+            intra[intra_offset+i, s, batch] =
                 s >= i ? exp(logs[s] - logs[i]) * products[i, C+s, batch] : 0.0f0
             solved[i, s] = i == s ? 1.0f0 : 0.0f0
         end
@@ -246,7 +246,8 @@ function delta_chunked!(owner, padded, query, key, mixed, beta, decay, cfg, toke
     width = dk + dv
     keys_queries = scratch(Float32, (dk, 2C, batches))
     scaled = scratch(Float32, (width, C, batches))
-    decayed_queries = scratch(Float32, (dk, C, batches))
+    hybrid = chunks >= 2 && cfg.key_dim in (64,128) && cfg.value_dim % 16 == 0
+    decayed_queries = scratch(Float32, (hybrid ? dk+C : dk, C, batches))
     ending_keys = scratch(Float32, (dk, C, batches))
     cumulative = scratch(Float32, (C, batches))
     gates = scratch(Float32, (C, batches))
@@ -296,13 +297,14 @@ function delta_chunked!(owner, padded, query, key, mixed, beta, decay, cfg, toke
         batches,
     )
     inverse = scratch(Float32, (C, C, batches))
-    intra = scratch(Float32, (C, C, batches))
+    intra = hybrid ? decayed_queries : scratch(Float32, (C, C, batches))
     CUDA.@cuda threads=4C blocks=batches delta_chunk_inverse_kernel!(
         inverse,
         intra,
         products,
         cumulative,
         gates,
+        Int32(hybrid ? dk : 0),
     )
     # solved[1:dk] = W' (reading keys), solved[dk+1:end] = U' (new values)
     solved = scratch(Float32, (width, C, batches))
@@ -328,6 +330,9 @@ function delta_chunked!(owner, padded, query, key, mixed, beta, decay, cfg, toke
         width * C,
         batches,
     )
+    if delta_chunked_hybrid!(owner, padded, solved, decayed_queries, ending_keys, growths, cfg, chunks)
+        return padded
+    end
     if chunks >= 3
         return delta_chunked_state_packed!(owner, padded, solved, decayed_queries,
             intra, ending_keys, growths, cfg, chunks)

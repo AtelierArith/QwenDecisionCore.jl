@@ -83,8 +83,8 @@ changes; no model weights are retained, and returned arrays remain owned by the
 caller. Nested and concurrent tasks use independent scratch. The internal
 `:reuse_workspace => false` diagnostic scope disables reuse. CUDA keeps one
 warmed computation graph per model workspace and invalidates it on buffer,
-layer, shape, math-policy, algorithm, or all-token-path changes. Input uploads
-and host readback remain outside capture. `QDC_CUDA_GRAPH=0` disables recording
+layer, shape, math-policy, algorithm, or all-token-path changes. The last-token graph includes pinned input uploads and host readback;
+all-token forwards retain their separate transfer path. `QDC_CUDA_GRAPH=0` disables recording
 and replay for diagnostics. Cold starts and frequently changing input lengths
 may benefit less than repeated warmed forwards.
 
@@ -100,3 +100,19 @@ The baseline is `e8a3db6`. The CPU path also reuses final-query attention
 projections and RoPE tables. For longer CUDA sequences, one wider state product
 replaces separate correction and query products; the packed output is converted
 back to the original token layout before normalization and gating.
+
+A [second comparison against main after PR #7](results/inference-next-15-2026-10-24.txt)
+(`f6a26ee`) passed another 15% on the same synthetic workload and hardware:
+
+| Backend | Baseline aggregate | Current aggregate | Higher inference speed |
+| --- | ---: | ---: | ---: |
+| CPU, Julia/BLAS one thread | 116.942 ms | 100.913 ms | 15.88% |
+| CUDA, RTX 3060 | 6.386 ms | 5.527 ms | 15.55% |
+
+Both CPU revisions were pinned to CPU 8 and measured consecutively. The CPU
+uses paired Delta updates, SIMD gate projections and normalization, and a
+private lazy MKL SGEMM on eligible Intel single-thread configurations. CUDA
+keeps chunk state hand-offs in shared memory, batches all chunk readouts, and
+stores Delta/MLP projections for NN GEMMs. Its last-token graph also captures
+pinned transfers. The linked record includes the per-length timings, errors,
+software versions, and reproduction commands.
